@@ -1,0 +1,14 @@
+defaults:
+  mode: log_only
+  ttl: 1h
+
+tools:
+  send_email:
+    mode: strict
+    ttl: 24h
+    normalize:
+      to: [lowercase, trim]
+      subject: [trim, collapse_whitespace]
+      body: [trim]
+    fingerprint_fields: [to, subject, body]
+    semantic_threshold: 0.9
