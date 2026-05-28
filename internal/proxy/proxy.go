@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/potent/potent/internal/fingerprint"
+	"github.com/potent/potent/internal/metrics"
 	"github.com/potent/potent/internal/normalizer"
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/store"
@@ -63,21 +64,61 @@ type Proxy struct {
 	store    store.Store
 	upstream *httputil.ReverseProxy
 	logger   *slog.Logger
+	metrics  *metrics.Metrics
 	now      func() time.Time
 }
 
+// Option configures a Proxy at construction time.
+type Option func(*Proxy)
+
+// WithMetrics attaches a metrics collector. Without it, the proxy still
+// operates correctly but emits no Prometheus samples.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(p *Proxy) { p.metrics = m }
+}
+
+// WithClock overrides time.Now (used for testing TTL stamping).
+func WithClock(clock func() time.Time) Option {
+	return func(p *Proxy) { p.now = clock }
+}
+
 // New constructs a Proxy that forwards uncached requests to upstream.
-func New(policies *policy.Config, st store.Store, upstream *url.URL, logger *slog.Logger) *Proxy {
+func New(policies *policy.Config, st store.Store, upstream *url.URL, logger *slog.Logger, opts ...Option) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Proxy{
+	p := &Proxy{
 		policies: policies,
 		store:    st,
 		upstream: httputil.NewSingleHostReverseProxy(upstream),
 		logger:   logger,
 		now:      time.Now,
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+func (p *Proxy) recordDecision(tool string, mode policy.Mode, decision Decision) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.Decisions.WithLabelValues(tool, string(mode), decision.String()).Inc()
+}
+
+func (p *Proxy) recordStoreError(op string) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.StoreErrors.WithLabelValues(op).Inc()
+}
+
+func (p *Proxy) recordUpstreamLatency(tool string, seconds float64) {
+	if p.metrics == nil {
+		return
+	}
+	p.metrics.UpstreamLatency.WithLabelValues(tool).Observe(seconds)
 }
 
 // ServeHTTP implements http.Handler.
@@ -121,6 +162,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"mode", string(pol.Mode),
 		"decision", decision.String(),
 	)
+	p.recordDecision(tool, pol.Mode, decision)
 
 	switch decision {
 	case DecisionReplay:
@@ -146,6 +188,7 @@ func (p *Proxy) decide(ctx context.Context, tool, hash string, pol policy.ToolPo
 			return DecisionForward, store.Entry{}, nil
 		}
 		if err != nil {
+			p.recordStoreError("get")
 			return DecisionForward, store.Entry{}, fmt.Errorf("store get: %w", err)
 		}
 		if pol.Mode == policy.ModeStrict && pol.RequireHumanConfirmOnReplay {
@@ -159,6 +202,7 @@ func (p *Proxy) decide(ctx context.Context, tool, hash string, pol policy.ToolPo
 func (p *Proxy) replay(ctx context.Context, w http.ResponseWriter, tool, hash string, e store.Entry) {
 	if err := p.store.IncrementReplay(ctx, tool, hash); err != nil {
 		p.logger.Warn("increment replay failed", "err", err)
+		p.recordStoreError("increment_replay")
 	}
 	w.Header().Set("X-Potent-Status", "replayed")
 	w.Header().Set("X-Potent-Hash", hash)
@@ -172,7 +216,9 @@ func (p *Proxy) forwardAndCache(w http.ResponseWriter, r *http.Request, tool, ha
 	rec.Header().Set("X-Potent-Status", "fresh")
 	rec.Header().Set("X-Potent-Hash", hash)
 
+	start := p.now()
 	p.upstream.ServeHTTP(rec, r)
+	p.recordUpstreamLatency(tool, p.now().Sub(start).Seconds())
 
 	if pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache {
 		if rec.status >= 200 && rec.status < 300 {
@@ -188,6 +234,7 @@ func (p *Proxy) forwardAndCache(w http.ResponseWriter, r *http.Request, tool, ha
 			})
 			if err != nil {
 				p.logger.Warn("store put failed", "err", err)
+				p.recordStoreError("put")
 			}
 		}
 	}

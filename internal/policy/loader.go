@@ -16,7 +16,8 @@ import (
 // rather than pulling in a YAML dependency for Week 1. The official YAML
 // parser will replace this once external deps are introduced.
 func Load(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
+	// path is supplied by the operator via -policy flag, not by untrusted input.
+	b, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
 		return nil, fmt.Errorf("read policy %q: %w", path, err)
 	}
