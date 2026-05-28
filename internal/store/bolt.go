@@ -91,6 +91,44 @@ func (b *Bolt) Put(ctx context.Context, e Entry) error {
 	})
 }
 
+// Scan iterates non-expired entries for the given tool using a bbolt cursor
+// over the bucket's key prefix.
+func (b *Bolt) Scan(ctx context.Context, tool string, visit func(Entry) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := b.now()
+	prefix := []byte(tool + "\x00")
+	return b.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketName).Cursor()
+		for k, v := c.Seek(prefix); k != nil && hasPrefix(k, prefix); k, v = c.Next() {
+			var e Entry
+			if err := json.Unmarshal(v, &e); err != nil {
+				continue // skip malformed
+			}
+			if e.Expired(now) {
+				continue
+			}
+			if !visit(e) {
+				return nil
+			}
+		}
+		return nil
+	})
+}
+
+func hasPrefix(b, prefix []byte) bool {
+	if len(b) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if b[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // IncrementReplay reads, mutates, and writes back the entry atomically inside
 // a single bbolt transaction.
 func (b *Bolt) IncrementReplay(ctx context.Context, tool, hash string) error {

@@ -28,6 +28,11 @@ type Entry struct {
 	CreatedAt   time.Time
 	ReplayCount int
 	TTL         time.Duration
+
+	// Embedding is the semantic vector of the request intent. nil means
+	// the entry was written before semantic indexing was enabled or the
+	// embedder is disabled for this tool.
+	Embedding []float32
 }
 
 // Expired reports whether the entry has aged past its TTL relative to now.
@@ -45,6 +50,9 @@ type Store interface {
 	Get(ctx context.Context, tool, hash string) (Entry, error)
 	Put(ctx context.Context, e Entry) error
 	IncrementReplay(ctx context.Context, tool, hash string) error
+	// Scan iterates non-expired entries for the given tool. The visitor
+	// returns false to stop iteration. Order is implementation-defined.
+	Scan(ctx context.Context, tool string, visit func(Entry) bool) error
 }
 
 // Memory is an in-memory Store suitable for tests and local development.
@@ -105,6 +113,33 @@ func (m *Memory) Put(ctx context.Context, e Entry) error {
 	m.entries[key(e.Tool, e.Hash)] = e
 	m.mu.Unlock()
 	return nil
+}
+
+// Scan iterates non-expired entries for the given tool.
+func (m *Memory) Scan(ctx context.Context, tool string, visit func(Entry) bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := m.now()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	prefix := tool + "\x00"
+	for k, e := range m.entries {
+		if !startsWith(k, prefix) {
+			continue
+		}
+		if e.Expired(now) {
+			continue
+		}
+		if !visit(e) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func startsWith(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 // IncrementReplay bumps the replay counter for an existing entry. Returns

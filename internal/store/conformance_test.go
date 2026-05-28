@@ -112,6 +112,89 @@ func conformanceSuite(t *testing.T, newStore func(clock func() time.Time) (Store
 		}
 	})
 
+	t.Run("ScanByTool", func(t *testing.T) {
+		clock = now
+		s, cleanup := newStore(clockFn)
+		defer cleanup()
+		ctx := context.Background()
+		_ = s.Put(ctx, Entry{Tool: "a", Hash: "1", TTL: time.Hour, CreatedAt: now})
+		_ = s.Put(ctx, Entry{Tool: "a", Hash: "2", TTL: time.Hour, CreatedAt: now})
+		_ = s.Put(ctx, Entry{Tool: "b", Hash: "1", TTL: time.Hour, CreatedAt: now})
+
+		var seen []string
+		err := s.Scan(ctx, "a", func(e Entry) bool {
+			seen = append(seen, e.Hash)
+			return true
+		})
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if len(seen) != 2 {
+			t.Errorf("expected 2 entries for tool 'a', got %d (%v)", len(seen), seen)
+		}
+	})
+
+	t.Run("ScanSkipsExpired", func(t *testing.T) {
+		clock = now
+		s, cleanup := newStore(clockFn)
+		defer cleanup()
+		ctx := context.Background()
+		_ = s.Put(ctx, Entry{Tool: "t", Hash: "live", TTL: time.Hour, CreatedAt: now})
+		_ = s.Put(ctx, Entry{Tool: "t", Hash: "dead", TTL: time.Minute, CreatedAt: now})
+		clock = now.Add(5 * time.Minute)
+
+		count := 0
+		_ = s.Scan(ctx, "t", func(e Entry) bool {
+			if e.Hash == "dead" {
+				t.Errorf("expired entry surfaced in Scan")
+			}
+			count++
+			return true
+		})
+		if count != 1 {
+			t.Errorf("expected 1 live entry, got %d", count)
+		}
+	})
+
+	t.Run("ScanEarlyStop", func(t *testing.T) {
+		clock = now
+		s, cleanup := newStore(clockFn)
+		defer cleanup()
+		ctx := context.Background()
+		for i := 0; i < 5; i++ {
+			_ = s.Put(ctx, Entry{Tool: "t", Hash: string(rune('a' + i)), TTL: time.Hour, CreatedAt: now})
+		}
+		count := 0
+		_ = s.Scan(ctx, "t", func(_ Entry) bool {
+			count++
+			return count < 2
+		})
+		if count != 2 {
+			t.Errorf("expected early stop after 2, got %d", count)
+		}
+	})
+
+	t.Run("EmbeddingRoundTrip", func(t *testing.T) {
+		clock = now
+		s, cleanup := newStore(clockFn)
+		defer cleanup()
+		ctx := context.Background()
+		emb := []float32{0.1, 0.2, 0.3, 0.4}
+		_ = s.Put(ctx, Entry{Tool: "t", Hash: "h", Embedding: emb, TTL: time.Hour, CreatedAt: now})
+		got, err := s.Get(ctx, "t", "h")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		if len(got.Embedding) != 4 {
+			t.Fatalf("embedding len = %d, want 4", len(got.Embedding))
+		}
+		for i := range emb {
+			if got.Embedding[i] != emb[i] {
+				t.Errorf("embedding[%d] = %v, want %v", i, got.Embedding[i], emb[i])
+			}
+		}
+	})
+
 	t.Run("Concurrent", func(t *testing.T) {
 		s, cleanup := newStore(clockFn)
 		defer cleanup()
