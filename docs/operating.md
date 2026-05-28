@@ -53,13 +53,25 @@ tools:
 ## Admin API (`-admin-addr`)
 
 ```
-GET  /stats?tool=NAME                  per-tool aggregates
-GET  /fingerprints?tool=NAME           list cached entries (redacted)
+GET    /stats?tool=NAME                per-tool aggregates
+GET    /fingerprints?tool=NAME         list cached entries (redacted)
 DELETE /fingerprints/{tool}/{hash}     evict one fingerprint
 ```
 
-Bind admin to `127.0.0.1:9095` or front it with auth. Never expose admin to the
-public internet — it accepts unauthenticated DELETE requests.
+**Authentication is required.** Set `POTENT_ADMIN_TOKEN` in the environment
+before starting potent with `-admin-addr`; the process refuses to start
+without it. Every admin request must carry:
+
+```
+Authorization: Bearer <POTENT_ADMIN_TOKEN>
+```
+
+Comparisons are constant-time. Generate the token with
+`openssl rand -hex 32` and store it in your secret manager.
+
+Bind to `127.0.0.1:9095` (the recommended value). Potent logs a warning when
+`-admin-addr` is not bound to loopback — even with a token, network exposure
+should be gated by mTLS or a NetworkPolicy.
 
 ## Audit log (`-audit-log`)
 

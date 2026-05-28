@@ -8,6 +8,7 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -32,7 +33,12 @@ type Eraser interface {
 
 // Handler returns an http.Handler that serves admin endpoints. If er is
 // nil, DELETE is disabled and the endpoint returns 501 Not Implemented.
-func Handler(in Inspector, er Eraser) http.Handler {
+//
+// The token, when non-empty, gates every endpoint: requests must carry
+// "Authorization: Bearer <token>" with a constant-time match. Construct a
+// Handler with an empty token only for tests; cmd/potent refuses to start
+// the admin server without one.
+func Handler(in Inspector, er Eraser, token string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		stats := computeStats(r.Context(), in, r.URL.Query().Get("tool"))
@@ -66,7 +72,26 @@ func Handler(in Inspector, er Eraser) http.Handler {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	return mux
+	return requireBearer(token, mux)
+}
+
+// requireBearer wraps next with constant-time bearer token validation. An
+// empty token disables auth — only acceptable in tests; production wiring
+// in cmd/potent rejects an empty token at startup.
+func requireBearer(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	expected := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare(got, expected) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="potent-admin"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Stats summarizes cache state per tool.
