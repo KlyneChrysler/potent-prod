@@ -1,0 +1,114 @@
+# Minimal potent deployment for Kubernetes.
+#
+# Apply with: kubectl apply -f deploy/k8s/potent.yaml
+#
+# Assumptions:
+# - Your tool server is reachable at http://tools.default.svc.cluster.local:8000
+# - You'll edit the upstream URL + image tag before shipping
+# - Audit log writes to an emptyDir; mount a PVC for durability
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: potent-policy
+  labels: { app: potent }
+data:
+  policy.yaml: |
+    defaults:
+      mode: log_only
+      ttl: 1h
+    tools:
+      send_email:
+        mode: strict
+        ttl: 24h
+        normalize:
+          to: [lowercase, trim]
+          subject: [trim, collapse_whitespace]
+        fingerprint_fields: [to, subject, body]
+        semantic_threshold: 0.9
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: potent
+  labels: { app: potent }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: potent }
+  template:
+    metadata:
+      labels: { app: potent }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: potent
+          image: ghcr.io/klynechrysler/potent:latest
+          args:
+            - -mode=http
+            - -addr=:8080
+            - -metrics-addr=:9090
+            - -admin-addr=:9095
+            - -upstream=http://tools.default.svc.cluster.local:8000
+            - -policy=/configs/policy.yaml
+            - -store=bolt
+            - -db=/data/potent.db
+            - -audit-log=/data/audit.log
+          ports:
+            - { name: proxy,   containerPort: 8080 }
+            - { name: metrics, containerPort: 9090 }
+            - { name: admin,   containerPort: 9095 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: proxy }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: proxy }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - { name: policy, mountPath: /configs }
+            - { name: data,   mountPath: /data }
+      volumes:
+        - name: policy
+          configMap: { name: potent-policy }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: potent
+  labels: { app: potent }
+spec:
+  selector: { app: potent }
+  ports:
+    - { name: proxy,   port: 8080, targetPort: proxy }
+    - { name: metrics, port: 9090, targetPort: metrics }
+---
+# Admin API exposed cluster-internal only; never bind to LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: potent-admin
+  labels: { app: potent, role: admin }
+spec:
+  selector: { app: potent }
+  clusterIP: None
+  ports:
+    - { name: admin, port: 9095, targetPort: admin }
