@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/potent/potent/internal/audit"
 	"github.com/potent/potent/internal/embed"
 	"github.com/potent/potent/internal/fingerprint"
 	"github.com/potent/potent/internal/metrics"
@@ -77,6 +78,7 @@ type Pipeline struct {
 	store    store.Store
 	embedder embed.Embedder
 	metrics  *metrics.Metrics
+	audit    *audit.Writer
 	now      func() time.Time
 }
 
@@ -97,9 +99,10 @@ func New(p *policy.Config, st store.Store, opts ...Option) *Pipeline {
 // Option configures the Pipeline.
 type Option func(*Pipeline)
 
-func WithEmbedder(e embed.Embedder) Option   { return func(p *Pipeline) { p.embedder = e } }
-func WithMetrics(m *metrics.Metrics) Option  { return func(p *Pipeline) { p.metrics = m } }
-func WithClock(c func() time.Time) Option    { return func(p *Pipeline) { p.now = c } }
+func WithEmbedder(e embed.Embedder) Option  { return func(p *Pipeline) { p.embedder = e } }
+func WithMetrics(m *metrics.Metrics) Option { return func(p *Pipeline) { p.metrics = m } }
+func WithClock(c func() time.Time) Option   { return func(p *Pipeline) { p.now = c } }
+func WithAudit(a *audit.Writer) Option      { return func(p *Pipeline) { p.audit = a } }
 
 // Lookup evaluates policy + cache without calling upstream. Returns the
 // decision (Replay/Block/Forward), the cached entry if applicable, and the
@@ -121,6 +124,7 @@ func (p *Pipeline) Lookup(ctx context.Context, tool string, body []byte) (Result
 
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
 	p.recordDecision(tool, pol.Mode, decision)
+	p.writeAudit(tool, string(pol.Mode), decision, match, hash, entry.Hash)
 
 	switch decision {
 	case DecisionReplay:
@@ -196,6 +200,7 @@ func (p *Pipeline) Apply(ctx context.Context, tool string, body []byte, forward 
 
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
 	p.recordDecision(tool, pol.Mode, decision)
+	p.writeAudit(tool, string(pol.Mode), decision, match, hash, entry.Hash)
 
 	switch decision {
 	case DecisionReplay:
@@ -319,6 +324,24 @@ func (p *Pipeline) recordStoreError(op string) {
 		return
 	}
 	p.metrics.StoreErrors.WithLabelValues(op).Inc()
+}
+
+func (p *Pipeline) writeAudit(tool, mode string, d Decision, match Match, freshHash, entryHash string) {
+	if p.audit == nil {
+		return
+	}
+	h := entryHash
+	if h == "" {
+		h = freshHash
+	}
+	p.audit.Write(audit.Record{
+		Tool:       tool,
+		Mode:       mode,
+		Decision:   d.String(),
+		Match:      match.Kind,
+		Similarity: match.Similarity,
+		Hash:       h,
+	})
 }
 
 func (p *Pipeline) recordUpstreamLatency(tool string, seconds float64) {
