@@ -1,0 +1,46 @@
+# potent policy file
+#
+# idempotency modes:
+#   strict   - block duplicate, replay cached response
+#   cache    - cache and replay (for read-only tools)
+#   log_only - detect duplicates, log them, but pass through
+#   off      - disable potent for this tool
+
+defaults:
+  mode: log_only
+  ttl: 1h
+  semantic_threshold: 0.94
+
+tools:
+  send_email:
+    mode: strict
+    ttl: 24h
+    normalize:
+      to: [lowercase, trim]
+      subject: [trim, collapse_whitespace]
+      body: [trim]
+    fingerprint_fields: [to, subject, body]
+    semantic_threshold: 0.94
+
+  charge_card:
+    mode: strict
+    ttl: 7d
+    normalize:
+      customer_id: [trim]
+      amount_cents: []
+    fingerprint_fields: [customer_id, amount_cents, currency]
+    semantic_threshold: 0.99   # higher bar for money
+
+  search_web:
+    mode: cache
+    ttl: 5m
+    fingerprint_fields: [query]
+
+  delete_user:
+    mode: strict
+    ttl: 7d
+    fingerprint_fields: [user_id]
+    require_human_confirm_on_replay: true
+
+  log_event:
+    mode: off
