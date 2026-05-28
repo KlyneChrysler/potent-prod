@@ -91,6 +91,21 @@ func (b *Bolt) Put(ctx context.Context, e Entry) error {
 	})
 }
 
+// Delete removes a single fingerprint. Returns ErrNotFound when absent.
+func (b *Bolt) Delete(ctx context.Context, tool, hash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	k := []byte(key(tool, hash))
+	return b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(bucketName)
+		if bkt.Get(k) == nil {
+			return ErrNotFound
+		}
+		return bkt.Delete(k)
+	})
+}
+
 // Scan iterates non-expired entries for the given tool using a bbolt cursor
 // over the bucket's key prefix.
 func (b *Bolt) Scan(ctx context.Context, tool string, visit func(Entry) bool) error {
