@@ -51,12 +51,24 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: potent
-          image: ghcr.io/klynechrysler/potent:latest
+          # Pin to a versioned tag in dev; for production prefer an
+          # immutable digest: image: ghcr.io/klynechrysler/potent@sha256:...
+          # Rotate via GitOps PRs that change the digest, never :latest.
+          image: ghcr.io/klynechrysler/potent:v0.1.0
+          imagePullPolicy: IfNotPresent
+          # POTENT_ADMIN_TOKEN gates every admin endpoint; the deployment
+          # refuses to start if -admin-addr is set without it.
+          env:
+            - name: POTENT_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: potent-admin
+                  key: token
           args:
             - -mode=http
             - -addr=:8080
             - -metrics-addr=:9090
-            - -admin-addr=:9095
+            - -admin-addr=127.0.0.1:9095  # loopback only; expose via NetworkPolicy + ingress with auth
             - -upstream=http://tools.default.svc.cluster.local:8000
             - -policy=/configs/policy.yaml
             - -store=bolt
@@ -65,7 +77,8 @@ spec:
           ports:
             - { name: proxy,   containerPort: 8080 }
             - { name: metrics, containerPort: 9090 }
-            - { name: admin,   containerPort: 9095 }
+            # admin is bound to 127.0.0.1 inside the pod — intentionally
+            # not declared as a containerPort to discourage Service exposure.
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -101,14 +114,17 @@ spec:
     - { name: proxy,   port: 8080, targetPort: proxy }
     - { name: metrics, port: 9090, targetPort: metrics }
 ---
-# Admin API exposed cluster-internal only; never bind to LoadBalancer.
+# Admin token secret. Populate via `kubectl create secret generic potent-admin
+# --from-literal=token=$(openssl rand -hex 32)`. Rotate on suspected exposure.
 apiVersion: v1
-kind: Service
+kind: Secret
 metadata:
   name: potent-admin
   labels: { app: potent, role: admin }
-spec:
-  selector: { app: potent }
-  clusterIP: None
-  ports:
-    - { name: admin, port: 9095, targetPort: admin }
+type: Opaque
+stringData:
+  token: "REPLACE-ME-WITH-AT-LEAST-32-RANDOM-CHARS"
+---
+# The admin port (9095) is loopback only inside the pod. To reach it from
+# operator tooling, use `kubectl port-forward` or front it with an
+# authenticated ingress + NetworkPolicy. Intentionally no Service.

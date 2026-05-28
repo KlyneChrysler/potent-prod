@@ -31,7 +31,7 @@ func seedStore(t *testing.T) store.Store {
 
 func TestHandler_ListFingerprintsByTool(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, s))
+	srv := httptest.NewServer(Handler(s, s, ""))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/fingerprints?tool=send_email")
@@ -53,7 +53,7 @@ func TestHandler_ListFingerprintsByTool(t *testing.T) {
 
 func TestHandler_ListRequiresTool(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, s))
+	srv := httptest.NewServer(Handler(s, s, ""))
 	defer srv.Close()
 	resp, _ := http.Get(srv.URL + "/fingerprints")
 	if resp.StatusCode != http.StatusBadRequest {
@@ -63,7 +63,7 @@ func TestHandler_ListRequiresTool(t *testing.T) {
 
 func TestHandler_StatsAggregates(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, s))
+	srv := httptest.NewServer(Handler(s, s, ""))
 	defer srv.Close()
 	resp, _ := http.Get(srv.URL + "/stats?tool=send_email")
 	if resp.StatusCode != http.StatusOK {
@@ -82,7 +82,7 @@ func TestHandler_StatsAggregates(t *testing.T) {
 
 func TestHandler_DeleteRemovesEntry(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, s))
+	srv := httptest.NewServer(Handler(s, s, ""))
 	defer srv.Close()
 
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/fingerprints/send_email/a", nil)
@@ -102,7 +102,7 @@ func TestHandler_DeleteRemovesEntry(t *testing.T) {
 
 func TestHandler_DeleteBadPath(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, s))
+	srv := httptest.NewServer(Handler(s, s, ""))
 	defer srv.Close()
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/fingerprints/onlyone", nil)
 	resp, _ := http.DefaultClient.Do(req)
@@ -113,7 +113,7 @@ func TestHandler_DeleteBadPath(t *testing.T) {
 
 func TestHandler_DeleteWithoutEraserReturns501(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, nil)) // no eraser
+	srv := httptest.NewServer(Handler(s, nil, "")) // no eraser
 	defer srv.Close()
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/fingerprints/send_email/a", nil)
 	resp, _ := http.DefaultClient.Do(req)
@@ -124,11 +124,51 @@ func TestHandler_DeleteWithoutEraserReturns501(t *testing.T) {
 
 func TestHandler_FingerprintsRejectsPost(t *testing.T) {
 	s := seedStore(t)
-	srv := httptest.NewServer(Handler(s, s))
+	srv := httptest.NewServer(Handler(s, s, ""))
 	defer srv.Close()
 	resp, _ := http.Post(srv.URL+"/fingerprints", "application/json", nil)
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestHandler_RejectsRequestWithoutBearerToken(t *testing.T) {
+	s := seedStore(t)
+	srv := httptest.NewServer(Handler(s, s, "s3cret"))
+	defer srv.Close()
+
+	resp, _ := http.Get(srv.URL + "/stats?tool=send_email")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("no header: status = %d, want 401", resp.StatusCode)
+	}
+	if resp.Header.Get("WWW-Authenticate") == "" {
+		t.Errorf("missing WWW-Authenticate challenge")
+	}
+}
+
+func TestHandler_RejectsRequestWithWrongToken(t *testing.T) {
+	s := seedStore(t)
+	srv := httptest.NewServer(Handler(s, s, "s3cret"))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/stats?tool=send_email", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong token: status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestHandler_AcceptsCorrectBearerToken(t *testing.T) {
+	s := seedStore(t)
+	srv := httptest.NewServer(Handler(s, s, "s3cret"))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/stats?tool=send_email", nil)
+	req.Header.Set("Authorization", "Bearer s3cret")
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("valid token: status = %d, want 200", resp.StatusCode)
 	}
 }
 

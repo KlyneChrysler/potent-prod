@@ -52,8 +52,10 @@ func run() error {
 	embedDim := flag.Int("embed-dim", 384, "embedding dimension")
 	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
 	auditPath := flag.String("audit-log", "", "append JSONL audit records to this path (empty = disabled)")
-	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled)")
+	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled; recommend 127.0.0.1:9095)")
 	flag.Parse()
+
+	adminToken := os.Getenv("POTENT_ADMIN_TOKEN")
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
@@ -106,7 +108,14 @@ func run() error {
 	)
 
 	if *adminAddr != "" {
-		go runAdmin(*adminAddr, st, logger)
+		if adminToken == "" {
+			return errors.New("admin server requested via -admin-addr but POTENT_ADMIN_TOKEN is empty; refusing to expose unauthenticated admin endpoints")
+		}
+		if !isLoopbackBind(*adminAddr) {
+			logger.Warn("admin-addr is not bound to loopback; ensure mTLS or network policy gates this port",
+				"admin_addr", *adminAddr)
+		}
+		go runAdmin(*adminAddr, st, adminToken, logger)
 	}
 
 	switch *mode {
@@ -195,16 +204,31 @@ func serveDual(addr, metricsAddr string, app http.Handler, m *metrics.Metrics, m
 	return srv.Shutdown(shutdownCtx)
 }
 
-func runAdmin(addr string, st store.Store, logger *slog.Logger) {
+func runAdmin(addr string, st store.Store, token string, logger *slog.Logger) {
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           admin.Handler(st, st),
+		Handler:           admin.Handler(st, st, token),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	logger.Info("admin api listening", "addr", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("admin server", "err", err)
 	}
+}
+
+// isLoopbackBind reports whether addr binds the listener to localhost only
+// (any of 127.0.0.1, ::1, localhost). Used to surface a warning when the
+// admin port would be reachable on a non-loopback interface.
+func isLoopbackBind(addr string) bool {
+	host := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		host = addr[:i]
+	}
+	switch host {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
 }
 
 func openStore(backend, dbPath string, logger *slog.Logger) (store.Store, func(), error) {
