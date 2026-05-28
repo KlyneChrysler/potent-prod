@@ -1,0 +1,108 @@
+version: 2
+
+project_name: potent
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: potent
+    main: ./cmd/potent
+    binary: potent
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: potent
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - configs/policy.yaml
+      - docs/operating.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: "^.*feat[(\\w]*:+.*$"
+      order: 0
+    - title: Fixes
+      regexp: "^.*fix[(\\w]*:+.*$"
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: KlyneChrysler
+    name: potent-prod
+  draft: false
+  prerelease: auto
+  header: |
+    ## potent {{.Tag}}
+
+    Exactly-once for AI agents. Drop in as a sidecar in front of any tool server (HTTP, MCP HTTP, or MCP stdio) and never send the same email / charge the same card / delete the same record twice.
+  footer: |
+    ---
+    Verify checksums:
+    ```
+    sha256sum -c checksums.txt
+    ```
+
+dockers:
+  - id: potent-amd64
+    image_templates:
+      - "ghcr.io/klynechrysler/potent:{{ .Version }}-amd64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/KlyneChrysler/potent-prod"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+  - id: potent-arm64
+    image_templates:
+      - "ghcr.io/klynechrysler/potent:{{ .Version }}-arm64"
+    dockerfile: Dockerfile
+    use: buildx
+    goarch: arm64
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.source=https://github.com/KlyneChrysler/potent-prod"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/klynechrysler/potent:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/klynechrysler/potent:{{ .Version }}-amd64"
+      - "ghcr.io/klynechrysler/potent:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/klynechrysler/potent:latest"
+    image_templates:
+      - "ghcr.io/klynechrysler/potent:{{ .Version }}-amd64"
+      - "ghcr.io/klynechrysler/potent:{{ .Version }}-arm64"

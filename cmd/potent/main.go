@@ -34,7 +34,18 @@ import (
 	"github.com/potent/potent/internal/store"
 )
 
+// Build metadata, populated by goreleaser via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-version" || os.Args[1] == "--version" || os.Args[1] == "version") {
+		fmt.Printf("potent %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
