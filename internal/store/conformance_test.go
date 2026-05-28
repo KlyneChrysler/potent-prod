@@ -174,6 +174,28 @@ func conformanceSuite(t *testing.T, newStore func(clock func() time.Time) (Store
 		}
 	})
 
+	t.Run("Delete", func(t *testing.T) {
+		clock = now
+		s, cleanup := newStore(clockFn)
+		defer cleanup()
+		ctx := context.Background()
+		_ = s.Put(ctx, Entry{Tool: "t", Hash: "h", TTL: time.Hour, CreatedAt: now})
+		if err := s.Delete(ctx, "t", "h"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if _, err := s.Get(ctx, "t", "h"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected entry gone after Delete, got %v", err)
+		}
+	})
+
+	t.Run("DeleteMissing", func(t *testing.T) {
+		s, cleanup := newStore(clockFn)
+		defer cleanup()
+		if err := s.Delete(context.Background(), "t", "h"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expected ErrNotFound, got %v", err)
+		}
+	})
+
 	t.Run("EmbeddingRoundTrip", func(t *testing.T) {
 		clock = now
 		s, cleanup := newStore(clockFn)

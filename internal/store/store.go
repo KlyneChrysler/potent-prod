@@ -53,6 +53,9 @@ type Store interface {
 	// Scan iterates non-expired entries for the given tool. The visitor
 	// returns false to stop iteration. Order is implementation-defined.
 	Scan(ctx context.Context, tool string, visit func(Entry) bool) error
+	// Delete removes a single fingerprint. Returns ErrNotFound when the
+	// entry doesn't exist so callers can render 404 idempotently.
+	Delete(ctx context.Context, tool, hash string) error
 }
 
 // Memory is an in-memory Store suitable for tests and local development.
@@ -112,6 +115,22 @@ func (m *Memory) Put(ctx context.Context, e Entry) error {
 	m.mu.Lock()
 	m.entries[key(e.Tool, e.Hash)] = e
 	m.mu.Unlock()
+	return nil
+}
+
+// Delete removes a single fingerprint. Returns ErrNotFound when the entry
+// is absent.
+func (m *Memory) Delete(ctx context.Context, tool, hash string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := key(tool, hash)
+	if _, ok := m.entries[k]; !ok {
+		return ErrNotFound
+	}
+	delete(m.entries, k)
 	return nil
 }
 

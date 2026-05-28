@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/potent/potent/internal/admin"
+	"github.com/potent/potent/internal/audit"
 	"github.com/potent/potent/internal/embed"
 	"github.com/potent/potent/internal/mcp"
 	"github.com/potent/potent/internal/metrics"
@@ -49,6 +51,8 @@ func run() error {
 	dbPath := flag.String("db", "potent.db", "BoltDB file path (when -store=bolt)")
 	embedDim := flag.Int("embed-dim", 384, "embedding dimension")
 	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
+	auditPath := flag.String("audit-log", "", "append JSONL audit records to this path (empty = disabled)")
+	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -74,11 +78,36 @@ func run() error {
 		return fmt.Errorf("embedder: %w", err)
 	}
 
+	var auditWriter *audit.Writer
+	if *auditPath != "" {
+		auditWriter, err = audit.Open(*auditPath, 1024)
+		if err != nil {
+			return fmt.Errorf("audit: %w", err)
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = auditWriter.Close(ctx)
+		}()
+	} else {
+		auditWriter = audit.NewDiscard()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = auditWriter.Close(ctx)
+		}()
+	}
+
 	m := metrics.New(nil)
 	pl := pipeline.New(cfg, st,
 		pipeline.WithMetrics(m),
 		pipeline.WithEmbedder(emb),
+		pipeline.WithAudit(auditWriter),
 	)
+
+	if *adminAddr != "" {
+		go runAdmin(*adminAddr, st, logger)
+	}
 
 	switch *mode {
 	case "http":
@@ -164,6 +193,18 @@ func serveDual(addr, metricsAddr string, app http.Handler, m *metrics.Metrics, m
 	defer cancel()
 	_ = metricsSrv.Shutdown(shutdownCtx)
 	return srv.Shutdown(shutdownCtx)
+}
+
+func runAdmin(addr string, st store.Store, logger *slog.Logger) {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           admin.Handler(st, st),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	logger.Info("admin api listening", "addr", addr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Error("admin server", "err", err)
+	}
 }
 
 func openStore(backend, dbPath string, logger *slog.Logger) (store.Store, func(), error) {
