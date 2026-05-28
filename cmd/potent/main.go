@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/potent/potent/internal/embed"
 	"github.com/potent/potent/internal/metrics"
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/proxy"
@@ -39,6 +40,8 @@ func run() error {
 	policyPath := flag.String("policy", "configs/policy.yaml", "policy YAML path")
 	backend := flag.String("store", "memory", "store backend: memory | bolt")
 	dbPath := flag.String("db", "potent.db", "BoltDB file path (when -store=bolt)")
+	embedDim := flag.Int("embed-dim", 384, "embedding dimension")
+	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -63,8 +66,16 @@ func run() error {
 	}
 	defer closeStore()
 
+	emb, err := embed.NewHashingTFIDF(*embedDim, *embedN)
+	if err != nil {
+		return fmt.Errorf("embedder: %w", err)
+	}
+
 	m := metrics.New(nil)
-	p := proxy.New(cfg, st, upstreamURL, logger, proxy.WithMetrics(m))
+	p := proxy.New(cfg, st, upstreamURL, logger,
+		proxy.WithMetrics(m),
+		proxy.WithEmbedder(emb),
+	)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -84,7 +95,7 @@ func run() error {
 
 	errCh := make(chan error, 2)
 	go func() {
-		logger.Info("potent proxy listening", "addr", *addr, "upstream", upstreamURL.String(), "policy", *policyPath, "store", *backend)
+		logger.Info("potent proxy listening", "addr", *addr, "upstream", upstreamURL.String(), "policy", *policyPath, "store", *backend, "embed_dim", *embedDim)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("proxy server: %w", err)
 		}

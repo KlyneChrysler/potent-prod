@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/potent/potent/internal/embed"
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/store"
 )
@@ -241,6 +242,113 @@ func TestProxy_CacheModeReplays(t *testing.T) {
 	var dummy any
 	if err := json.Unmarshal(b2, &dummy); err != nil {
 		t.Errorf("cached body not valid JSON: %v", err)
+	}
+}
+
+func newProxyWithEmbedder(t *testing.T, cfg *policy.Config, upstreamURL string) (*Proxy, store.Store) {
+	t.Helper()
+	u, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parse upstream: %v", err)
+	}
+	st := store.NewMemory(nil)
+	emb, err := embed.NewHashingTFIDF(384, 4)
+	if err != nil {
+		t.Fatalf("embedder: %v", err)
+	}
+	return New(cfg, st, u, nil, WithEmbedder(emb)), st
+}
+
+func TestProxy_SemanticReplayOnNearDuplicate(t *testing.T) {
+	var calls int32
+	upstream := makeUpstream(t, &calls, `{"ok":true,"id":"msg-1"}`)
+	cfg := &policy.Config{
+		Tools: map[string]policy.ToolPolicy{
+			"send_email": {
+				Mode:              policy.ModeStrict,
+				TTL:               time.Hour,
+				FingerprintFields: []string{"to", "subject", "body"},
+				SemanticThreshold: 0.9,
+			},
+		},
+	}
+	p, _ := newProxyWithEmbedder(t, cfg, upstream.URL)
+
+	// First call seeds the cache.
+	first := `{"to":"alice@example.com","subject":"Q3 report","body":"Please find attached the Q3 financial report for review."}`
+	resp1 := doPost(t, p, "send_email", first)
+	if resp1.Header.Get("X-Potent-Status") != "fresh" {
+		t.Fatalf("first call must be fresh, got %q", resp1.Header.Get("X-Potent-Status"))
+	}
+
+	// Near-duplicate: same recipient/subject, body with minor edits.
+	// Exact hash differs (body wording changed), but semantic match should fire.
+	near := `{"to":"alice@example.com","subject":"Q3 report","body":"Please find attached the Q3 financial report for your review."}`
+	resp2 := doPost(t, p, "send_email", near)
+
+	if resp2.Header.Get("X-Potent-Status") != "replayed" {
+		t.Errorf("expected semantic replay, got status %q", resp2.Header.Get("X-Potent-Status"))
+	}
+	if resp2.Header.Get("X-Potent-Match") != "semantic" {
+		t.Errorf("expected match=semantic, got %q", resp2.Header.Get("X-Potent-Match"))
+	}
+	if got := resp2.Header.Get("X-Potent-Similarity"); got == "" {
+		t.Errorf("expected X-Potent-Similarity to be set")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("expected upstream calls=1 (semantic replayed), got %d", got)
+	}
+}
+
+func TestProxy_SemanticDoesNotReplayUnrelated(t *testing.T) {
+	var calls int32
+	upstream := makeUpstream(t, &calls, `{"ok":true}`)
+	cfg := &policy.Config{
+		Tools: map[string]policy.ToolPolicy{
+			"send_email": {
+				Mode:              policy.ModeStrict,
+				TTL:               time.Hour,
+				FingerprintFields: []string{"to", "subject", "body"},
+				SemanticThreshold: 0.9,
+			},
+		},
+	}
+	p, _ := newProxyWithEmbedder(t, cfg, upstream.URL)
+
+	_ = doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"financial summary attached"}`)
+	resp := doPost(t, p, "send_email", `{"to":"bob@somewhere.org","subject":"office party invite","body":"come join us Friday for drinks"}`)
+
+	if resp.Header.Get("X-Potent-Status") == "replayed" {
+		t.Errorf("unrelated request must not replay")
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("expected 2 upstream calls, got %d", got)
+	}
+}
+
+func TestProxy_SemanticDisabledWhenThresholdZero(t *testing.T) {
+	var calls int32
+	upstream := makeUpstream(t, &calls, `{"ok":true}`)
+	cfg := &policy.Config{
+		Tools: map[string]policy.ToolPolicy{
+			"send_email": {
+				Mode:              policy.ModeStrict,
+				TTL:               time.Hour,
+				FingerprintFields: []string{"to", "subject", "body"},
+				SemanticThreshold: 0, // disabled
+			},
+		},
+	}
+	p, _ := newProxyWithEmbedder(t, cfg, upstream.URL)
+
+	_ = doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"financial summary attached"}`)
+	resp := doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"financial summary attached please"}`)
+
+	if resp.Header.Get("X-Potent-Status") == "replayed" {
+		t.Errorf("semantic disabled, must not replay near-duplicate")
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("expected 2 upstream calls, got %d", got)
 	}
 }
 
