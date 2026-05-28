@@ -1,9 +1,12 @@
 // Command potent is the semantic-idempotency gateway entrypoint.
 //
-// It loads a policy YAML, constructs the configured store backend
-// (memory or bolt), exposes Prometheus metrics, and forwards inbound
-// HTTP requests through the idempotency pipeline to the upstream tool
-// server.
+// It loads a policy YAML, constructs the configured store backend, exposes
+// Prometheus metrics, and runs inbound requests through the idempotency
+// pipeline. Three modes are supported:
+//
+//   - http: generic HTTP reverse proxy keyed on the X-Potent-Tool header
+//   - mcp-http: MCP Streamable HTTP, intercepts JSON-RPC tools/call frames
+//   - mcp-stdio: spawns an MCP server as a child and proxies its stdio
 package main
 
 import (
@@ -16,11 +19,14 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/potent/potent/internal/embed"
+	"github.com/potent/potent/internal/mcp"
 	"github.com/potent/potent/internal/metrics"
+	"github.com/potent/potent/internal/pipeline"
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/proxy"
 	"github.com/potent/potent/internal/store"
@@ -34,9 +40,10 @@ func main() {
 }
 
 func run() error {
-	addr := flag.String("addr", ":8080", "listen address")
-	metricsAddr := flag.String("metrics-addr", ":9090", "metrics listen address")
-	upstream := flag.String("upstream", "", "upstream tool server URL (required)")
+	mode := flag.String("mode", "http", "operating mode: http | mcp-http | mcp-stdio")
+	addr := flag.String("addr", ":8080", "listen address (http and mcp-http)")
+	metricsAddr := flag.String("metrics-addr", ":9090", "metrics listen address (http and mcp-http)")
+	upstream := flag.String("upstream", "", "upstream URL (http, mcp-http) or command (mcp-stdio)")
 	policyPath := flag.String("policy", "configs/policy.yaml", "policy YAML path")
 	backend := flag.String("store", "memory", "store backend: memory | bolt")
 	dbPath := flag.String("db", "potent.db", "BoltDB file path (when -store=bolt)")
@@ -49,10 +56,6 @@ func run() error {
 
 	if *upstream == "" {
 		return errors.New("flag -upstream is required")
-	}
-	upstreamURL, err := url.Parse(*upstream)
-	if err != nil {
-		return err
 	}
 
 	cfg, err := policy.Load(*policyPath)
@@ -72,36 +75,79 @@ func run() error {
 	}
 
 	m := metrics.New(nil)
-	p := proxy.New(cfg, st, upstreamURL, logger,
-		proxy.WithMetrics(m),
-		proxy.WithEmbedder(emb),
+	pl := pipeline.New(cfg, st,
+		pipeline.WithMetrics(m),
+		pipeline.WithEmbedder(emb),
 	)
 
+	switch *mode {
+	case "http":
+		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger)
+	case "mcp-http":
+		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger)
+	case "mcp-stdio":
+		return runMCPStdio(*upstream, pl, logger)
+	default:
+		return fmt.Errorf("unknown mode %q (want http | mcp-http | mcp-stdio)", *mode)
+	}
+}
+
+func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger) error {
+	u, err := url.Parse(upstream)
+	if err != nil {
+		return err
+	}
+	p := proxy.New(pl, u, logger)
+	return serveDual(addr, metricsAddr, p, m, "http", upstream, logger)
+}
+
+func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger) error {
+	u, err := url.Parse(upstream)
+	if err != nil {
+		return err
+	}
+	h := mcp.NewHTTPHandler(pl, u, logger)
+	return serveDual(addr, metricsAddr, h, m, "mcp-http", upstream, logger)
+}
+
+func runMCPStdio(cmd string, pl *pipeline.Pipeline, logger *slog.Logger) error {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 {
+		return errors.New("mcp-stdio: -upstream must be a command to exec")
+	}
+	h := mcp.NewStdioHandler(pl, parts[0], parts[1:], logger)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	logger.Info("potent mcp-stdio starting", "cmd", cmd)
+	return h.Run(ctx, os.Stdin, os.Stdout)
+}
+
+func serveDual(addr, metricsAddr string, app http.Handler, m *metrics.Metrics, mode, upstream string, logger *slog.Logger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("/", p)
+	mux.Handle("/", app)
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", m.Handler())
 
-	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	metricsSrv := &http.Server{Addr: *metricsAddr, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	metricsSrv := &http.Server{Addr: metricsAddr, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	errCh := make(chan error, 2)
 	go func() {
-		logger.Info("potent proxy listening", "addr", *addr, "upstream", upstreamURL.String(), "policy", *policyPath, "store", *backend, "embed_dim", *embedDim)
+		logger.Info("potent listening", "mode", mode, "addr", addr, "upstream", upstream)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("proxy server: %w", err)
 		}
 	}()
 	go func() {
-		logger.Info("metrics server listening", "addr", *metricsAddr)
+		logger.Info("metrics server listening", "addr", metricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("metrics server: %w", err)
 		}

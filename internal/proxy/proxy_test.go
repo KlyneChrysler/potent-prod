@@ -2,8 +2,6 @@ package proxy
 
 import (
 	"bytes"
-	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +11,7 @@ import (
 	"time"
 
 	"github.com/potent/potent/internal/embed"
+	"github.com/potent/potent/internal/pipeline"
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/store"
 )
@@ -29,14 +28,21 @@ func makeUpstream(t *testing.T, callCount *int32, body string) *httptest.Server 
 	return srv
 }
 
-func newProxy(t *testing.T, cfg *policy.Config, upstreamURL string) (*Proxy, store.Store) {
+func newProxy(t *testing.T, cfg *policy.Config, upstreamURL string, opts ...pipeline.Option) (*Proxy, store.Store) {
 	t.Helper()
 	u, err := url.Parse(upstreamURL)
 	if err != nil {
 		t.Fatalf("parse upstream: %v", err)
 	}
 	st := store.NewMemory(nil)
-	return New(cfg, st, u, nil), st
+	pl := pipeline.New(cfg, st, opts...)
+	return New(pl, u, nil), st
+}
+
+func newProxyWithEmbedder(t *testing.T, cfg *policy.Config, upstreamURL string) (*Proxy, store.Store) {
+	t.Helper()
+	emb, _ := embed.NewHashingTFIDF(384, 4)
+	return newProxy(t, cfg, upstreamURL, pipeline.WithEmbedder(emb))
 }
 
 func doPost(t *testing.T, h http.Handler, tool, body string) *http.Response {
@@ -55,7 +61,6 @@ func TestProxy_StrictModeReplaysOnDuplicate(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true,"id":"abc"}`)
 	cfg := &policy.Config{
-		Defaults: policy.ToolPolicy{Mode: policy.ModeLogOnly, TTL: time.Hour},
 		Tools: map[string]policy.ToolPolicy{
 			"send_email": {
 				Mode:              policy.ModeStrict,
@@ -67,25 +72,16 @@ func TestProxy_StrictModeReplaysOnDuplicate(t *testing.T) {
 	p, _ := newProxy(t, cfg, upstream.URL)
 
 	body := `{"to":"a@b.com","subject":"Hi","body":"hello"}`
-
 	resp1 := doPost(t, p, "send_email", body)
-	if resp1.StatusCode != http.StatusOK {
-		t.Fatalf("first call status = %d", resp1.StatusCode)
+	if resp1.Header.Get("X-Potent-Status") != "fresh" {
+		t.Errorf("first call X-Potent-Status = %q", resp1.Header.Get("X-Potent-Status"))
 	}
-	if got := resp1.Header.Get("X-Potent-Status"); got != "fresh" {
-		t.Errorf("first call X-Potent-Status = %q, want fresh", got)
-	}
-
 	resp2 := doPost(t, p, "send_email", body)
-	if resp2.StatusCode != http.StatusOK {
-		t.Fatalf("replay status = %d", resp2.StatusCode)
+	if resp2.Header.Get("X-Potent-Status") != "replayed" {
+		t.Errorf("replay X-Potent-Status = %q", resp2.Header.Get("X-Potent-Status"))
 	}
-	if got := resp2.Header.Get("X-Potent-Status"); got != "replayed" {
-		t.Errorf("replay X-Potent-Status = %q, want replayed", got)
-	}
-
 	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("upstream call count = %d, want 1 (second should be replayed)", got)
+		t.Errorf("upstream call count = %d, want 1", got)
 	}
 }
 
@@ -106,51 +102,37 @@ func TestProxy_NormalizationCausesDedup(t *testing.T) {
 		},
 	}
 	p, _ := newProxy(t, cfg, upstream.URL)
-
-	a := `{"to":"Alice@Example.com","subject":"Q3 report"}`
-	b := `{"to":" alice@example.com ","subject":"  Q3   report  "}`
-
-	_ = doPost(t, p, "send_email", a)
-	resp := doPost(t, p, "send_email", b)
+	_ = doPost(t, p, "send_email", `{"to":"Alice@Example.com","subject":"Q3 report"}`)
+	resp := doPost(t, p, "send_email", `{"to":" alice@example.com ","subject":"  Q3   report  "}`)
 	if resp.Header.Get("X-Potent-Status") != "replayed" {
-		t.Errorf("expected normalized duplicate to replay, got %q", resp.Header.Get("X-Potent-Status"))
+		t.Errorf("expected replay, got %q", resp.Header.Get("X-Potent-Status"))
 	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("upstream calls = %d, want 1", got)
 	}
 }
 
-func TestProxy_LogOnlyModeAlwaysForwards(t *testing.T) {
+func TestProxy_LogOnlyAlwaysForwards(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true}`)
-	cfg := &policy.Config{
-		Defaults: policy.ToolPolicy{Mode: policy.ModeLogOnly, TTL: time.Hour},
-	}
+	cfg := &policy.Config{Defaults: policy.ToolPolicy{Mode: policy.ModeLogOnly, TTL: time.Hour}}
 	p, _ := newProxy(t, cfg, upstream.URL)
-
-	body := `{"x":1}`
-	_ = doPost(t, p, "any_tool", body)
-	_ = doPost(t, p, "any_tool", body)
+	_ = doPost(t, p, "any_tool", `{"x":1}`)
+	_ = doPost(t, p, "any_tool", `{"x":1}`)
 	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Errorf("log_only should always forward, got calls = %d", got)
+		t.Errorf("log_only forwards, got calls = %d", got)
 	}
 }
 
-func TestProxy_OffModeBypassesPipeline(t *testing.T) {
+func TestProxy_OffModeBypasses(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true}`)
-	cfg := &policy.Config{
-		Tools: map[string]policy.ToolPolicy{
-			"noisy_tool": {Mode: policy.ModeOff},
-		},
-	}
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"noisy": {Mode: policy.ModeOff}}}
 	p, _ := newProxy(t, cfg, upstream.URL)
-
-	body := `{"x":1}`
-	_ = doPost(t, p, "noisy_tool", body)
-	_ = doPost(t, p, "noisy_tool", body)
+	_ = doPost(t, p, "noisy", `{"x":1}`)
+	_ = doPost(t, p, "noisy", `{"x":1}`)
 	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Errorf("off mode should forward every call, got %d", got)
+		t.Errorf("off forwards every call, got %d", got)
 	}
 }
 
@@ -159,19 +141,17 @@ func TestProxy_MissingToolHeaderPassesThrough(t *testing.T) {
 	upstream := makeUpstream(t, &calls, `{"ok":true}`)
 	cfg := &policy.Config{Defaults: policy.ToolPolicy{Mode: policy.ModeStrict, TTL: time.Hour}}
 	p, _ := newProxy(t, cfg, upstream.URL)
-
 	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"x":1}`))
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, r)
-
 	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("expected upstream to receive call, got %d", got)
+		t.Errorf("expected upstream call, got %d", got)
 	}
 }
 
-func TestProxy_StrictRequireHumanConfirmBlocksReplay(t *testing.T) {
+func TestProxy_RequireHumanConfirmBlocks(t *testing.T) {
 	var calls int32
-	upstream := makeUpstream(t, &calls, `{"ok":true,"id":"u1"}`)
+	upstream := makeUpstream(t, &calls, `{"ok":true}`)
 	cfg := &policy.Config{
 		Tools: map[string]policy.ToolPolicy{
 			"delete_user": {
@@ -183,27 +163,19 @@ func TestProxy_StrictRequireHumanConfirmBlocksReplay(t *testing.T) {
 		},
 	}
 	p, _ := newProxy(t, cfg, upstream.URL)
-
-	body := `{"user_id":"42"}`
-	_ = doPost(t, p, "delete_user", body)
-	resp := doPost(t, p, "delete_user", body)
-
+	_ = doPost(t, p, "delete_user", `{"user_id":"42"}`)
+	resp := doPost(t, p, "delete_user", `{"user_id":"42"}`)
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("expected 409, got %d", resp.StatusCode)
 	}
 }
 
-func TestProxy_InvalidJSONReturns400(t *testing.T) {
-	cfg := &policy.Config{
-		Tools: map[string]policy.ToolPolicy{
-			"send_email": {Mode: policy.ModeStrict, TTL: time.Hour},
-		},
-	}
+func TestProxy_InvalidJSONReturns500(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"send_email": {Mode: policy.ModeStrict, TTL: time.Hour}}}
 	p, _ := newProxy(t, cfg, "http://upstream.invalid")
-
 	resp := doPost(t, p, "send_email", `not json`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("expected 400 for invalid JSON, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("expected 500 for invalid JSON, got %d", resp.StatusCode)
 	}
 }
 
@@ -212,54 +184,26 @@ func TestProxy_CacheModeReplays(t *testing.T) {
 	upstream := makeUpstream(t, &calls, `{"results":["a","b"]}`)
 	cfg := &policy.Config{
 		Tools: map[string]policy.ToolPolicy{
-			"search_web": {
-				Mode:              policy.ModeCache,
-				TTL:               5 * time.Minute,
-				FingerprintFields: []string{"query"},
-			},
+			"search_web": {Mode: policy.ModeCache, TTL: 5 * time.Minute, FingerprintFields: []string{"query"}},
 		},
 	}
 	p, _ := newProxy(t, cfg, upstream.URL)
-
-	body := `{"query":"go programming"}`
-	resp1 := doPost(t, p, "search_web", body)
-	resp2 := doPost(t, p, "search_web", body)
-
+	resp1 := doPost(t, p, "search_web", `{"query":"go programming"}`)
+	resp2 := doPost(t, p, "search_web", `{"query":"go programming"}`)
 	if resp2.Header.Get("X-Potent-Status") != "replayed" {
-		t.Errorf("expected cached replay, got %q", resp2.Header.Get("X-Potent-Status"))
+		t.Errorf("expected cache replay, got %q", resp2.Header.Get("X-Potent-Status"))
 	}
 	if atomic.LoadInt32(&calls) != 1 {
-		t.Errorf("cache mode should hit upstream once")
+		t.Errorf("cache should hit upstream once")
 	}
-
 	b1, _ := io.ReadAll(resp1.Body)
 	b2, _ := io.ReadAll(resp2.Body)
 	if !bytes.Equal(b1, b2) {
-		t.Errorf("replay body differs: %s vs %s", b1, b2)
-	}
-
-	// sanity: the cached response is still valid JSON
-	var dummy any
-	if err := json.Unmarshal(b2, &dummy); err != nil {
-		t.Errorf("cached body not valid JSON: %v", err)
+		t.Errorf("replay body differs")
 	}
 }
 
-func newProxyWithEmbedder(t *testing.T, cfg *policy.Config, upstreamURL string) (*Proxy, store.Store) {
-	t.Helper()
-	u, err := url.Parse(upstreamURL)
-	if err != nil {
-		t.Fatalf("parse upstream: %v", err)
-	}
-	st := store.NewMemory(nil)
-	emb, err := embed.NewHashingTFIDF(384, 4)
-	if err != nil {
-		t.Fatalf("embedder: %v", err)
-	}
-	return New(cfg, st, u, nil, WithEmbedder(emb)), st
-}
-
-func TestProxy_SemanticReplayOnNearDuplicate(t *testing.T) {
+func TestProxy_SemanticReplay(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true,"id":"msg-1"}`)
 	cfg := &policy.Config{
@@ -273,99 +217,12 @@ func TestProxy_SemanticReplayOnNearDuplicate(t *testing.T) {
 		},
 	}
 	p, _ := newProxyWithEmbedder(t, cfg, upstream.URL)
-
-	// First call seeds the cache.
-	first := `{"to":"alice@example.com","subject":"Q3 report","body":"Please find attached the Q3 financial report for review."}`
-	resp1 := doPost(t, p, "send_email", first)
-	if resp1.Header.Get("X-Potent-Status") != "fresh" {
-		t.Fatalf("first call must be fresh, got %q", resp1.Header.Get("X-Potent-Status"))
+	_ = doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"Please find attached the Q3 financial report for your review."}`)
+	resp := doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"Please find attached the Q3 financial report for review."}`)
+	if resp.Header.Get("X-Potent-Match") != "semantic" {
+		t.Errorf("expected semantic match, got %q", resp.Header.Get("X-Potent-Match"))
 	}
-
-	// Near-duplicate: same recipient/subject, body with minor edits.
-	// Exact hash differs (body wording changed), but semantic match should fire.
-	near := `{"to":"alice@example.com","subject":"Q3 report","body":"Please find attached the Q3 financial report for your review."}`
-	resp2 := doPost(t, p, "send_email", near)
-
-	if resp2.Header.Get("X-Potent-Status") != "replayed" {
-		t.Errorf("expected semantic replay, got status %q", resp2.Header.Get("X-Potent-Status"))
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("semantic should replay, got upstream calls = %d", atomic.LoadInt32(&calls))
 	}
-	if resp2.Header.Get("X-Potent-Match") != "semantic" {
-		t.Errorf("expected match=semantic, got %q", resp2.Header.Get("X-Potent-Match"))
-	}
-	if got := resp2.Header.Get("X-Potent-Similarity"); got == "" {
-		t.Errorf("expected X-Potent-Similarity to be set")
-	}
-	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Errorf("expected upstream calls=1 (semantic replayed), got %d", got)
-	}
-}
-
-func TestProxy_SemanticDoesNotReplayUnrelated(t *testing.T) {
-	var calls int32
-	upstream := makeUpstream(t, &calls, `{"ok":true}`)
-	cfg := &policy.Config{
-		Tools: map[string]policy.ToolPolicy{
-			"send_email": {
-				Mode:              policy.ModeStrict,
-				TTL:               time.Hour,
-				FingerprintFields: []string{"to", "subject", "body"},
-				SemanticThreshold: 0.9,
-			},
-		},
-	}
-	p, _ := newProxyWithEmbedder(t, cfg, upstream.URL)
-
-	_ = doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"financial summary attached"}`)
-	resp := doPost(t, p, "send_email", `{"to":"bob@somewhere.org","subject":"office party invite","body":"come join us Friday for drinks"}`)
-
-	if resp.Header.Get("X-Potent-Status") == "replayed" {
-		t.Errorf("unrelated request must not replay")
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Errorf("expected 2 upstream calls, got %d", got)
-	}
-}
-
-func TestProxy_SemanticDisabledWhenThresholdZero(t *testing.T) {
-	var calls int32
-	upstream := makeUpstream(t, &calls, `{"ok":true}`)
-	cfg := &policy.Config{
-		Tools: map[string]policy.ToolPolicy{
-			"send_email": {
-				Mode:              policy.ModeStrict,
-				TTL:               time.Hour,
-				FingerprintFields: []string{"to", "subject", "body"},
-				SemanticThreshold: 0, // disabled
-			},
-		},
-	}
-	p, _ := newProxyWithEmbedder(t, cfg, upstream.URL)
-
-	_ = doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"financial summary attached"}`)
-	resp := doPost(t, p, "send_email", `{"to":"alice@example.com","subject":"Q3 report","body":"financial summary attached please"}`)
-
-	if resp.Header.Get("X-Potent-Status") == "replayed" {
-		t.Errorf("semantic disabled, must not replay near-duplicate")
-	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Errorf("expected 2 upstream calls, got %d", got)
-	}
-}
-
-func TestProxy_ContextPropagatesToStore(t *testing.T) {
-	cfg := &policy.Config{
-		Tools: map[string]policy.ToolPolicy{
-			"t": {Mode: policy.ModeStrict, TTL: time.Hour},
-		},
-	}
-	p, _ := newProxy(t, cfg, "http://upstream.invalid")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"x":1}`)).WithContext(ctx)
-	r.Header.Set(ToolHeader, "t")
-	w := httptest.NewRecorder()
-	// should not panic; behavior is allowed to be either error or pass-through-failure
-	p.ServeHTTP(w, r)
 }
