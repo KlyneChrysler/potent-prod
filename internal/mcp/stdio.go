@@ -259,13 +259,19 @@ func (h *StdioHandler) maybeCacheResponse(msg *Message, raw []byte) []json.RawMe
 	return ifc.waiters
 }
 
+// minSweepInterval bounds how often the sweeper can run regardless of
+// requestTimeout. Operators with very short timeouts (e.g. test or local
+// debugging) still get reasonably prompt expiry; production deployments
+// with the 60s default get a ~15s tick which is plenty.
+var minSweepInterval = 500 * time.Millisecond
+
 // sweepExpired periodically scans the pending and inflight maps for entries
 // past their deadline, releases them, and notifies any waiting clients
 // with a JSON-RPC error so they don't hang forever.
 func (h *StdioHandler) sweepExpired(ctx context.Context, clientOut io.Writer) {
 	interval := h.requestTimeout / 4
-	if interval < 5*time.Second {
-		interval = 5 * time.Second
+	if interval < minSweepInterval {
+		interval = minSweepInterval
 	}
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
