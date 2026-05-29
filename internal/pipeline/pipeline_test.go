@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,6 +282,56 @@ func TestBuildIntent_HandlesScalarTypes(t *testing.T) {
 	_, _ = pl.Apply(context.Background(), "t", []byte(`{"s":"x","n":3.14,"b":true,"z":null}`), func(ctx context.Context) (int, []byte, error) {
 		return 200, []byte("ok"), nil
 	})
+}
+
+func TestApply_CoalescesConcurrentDuplicates(t *testing.T) {
+	// Three concurrent Apply calls with the same body and tool should result
+	// in exactly one forward() invocation; the other two should receive the
+	// leader's response without their own forward closures being called.
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+
+	var forwardCalls int32
+	// gate the leader's forward so all three Apply calls overlap in flight
+	release := make(chan struct{})
+	forward := func(ctx context.Context) (int, []byte, error) {
+		n := atomic.AddInt32(&forwardCalls, 1)
+		if n == 1 {
+			<-release // block leader until siblings have arrived
+		}
+		return 200, []byte(`{"id":"x"}`), nil
+	}
+
+	body := []byte(`{"to":"a@b.com"}`)
+	results := make([]Result, 3)
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, _ := pl.Apply(context.Background(), "send_email", body, forward)
+			results[i] = res
+		}(i)
+	}
+
+	// give siblings a moment to enter Apply and find the leader's inflight
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&forwardCalls); got != 1 {
+		t.Errorf("forward called %d times, want 1", got)
+	}
+	for i, r := range results {
+		if r.StatusCode != 200 {
+			t.Errorf("result[%d] status = %d", i, r.StatusCode)
+		}
+		if string(r.Body) != `{"id":"x"}` {
+			t.Errorf("result[%d] body = %s", i, r.Body)
+		}
+	}
 }
 
 func TestDecision_String(t *testing.T) {
