@@ -34,6 +34,7 @@ type HTTPHandler struct {
 	maxBodyBytes int64
 	apiToken     string
 	apiTokens    map[string]string
+	oidcVerifier auth.TokenVerifier
 }
 
 // HTTPOption configures an HTTPHandler at construction time.
@@ -55,6 +56,13 @@ func WithHTTPAPIToken(token string) HTTPOption {
 // caller-id is attached to the request context for ACL enforcement.
 func WithHTTPAPITokensFile(tokens map[string]string) HTTPOption {
 	return func(h *HTTPHandler) { h.apiTokens = tokens }
+}
+
+// WithHTTPOIDCVerifier installs a JWKS-backed JWT verifier on the mcp
+// http handler. Takes precedence over WithHTTPAPITokensFile and
+// WithHTTPAPIToken when set.
+func WithHTTPOIDCVerifier(v auth.TokenVerifier) HTTPOption {
+	return func(h *HTTPHandler) { h.oidcVerifier = v }
 }
 
 // WithHTTPUpstreamTLS sets the TLS configuration for the http.Client that
@@ -95,9 +103,12 @@ func NewHTTPHandler(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logge
 // token (apiToken).
 func (h *HTTPHandler) Handler() http.Handler {
 	var inner http.Handler = h
-	if len(h.apiTokens) > 0 {
+	switch {
+	case h.oidcVerifier != nil:
+		inner = auth.RequireBearerVerifier(h.oidcVerifier, "potent-mcp", inner)
+	case len(h.apiTokens) > 0:
 		inner = auth.RequireBearerCallers(h.apiTokens, "potent-mcp", inner)
-	} else {
+	default:
 		inner = auth.RequireBearer(h.apiToken, "potent-mcp", inner)
 	}
 	return tracing.Middleware(inner)

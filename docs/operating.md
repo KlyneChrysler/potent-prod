@@ -94,6 +94,24 @@ Sends are buffered through a 1024-deep channel; the writer goroutine drains
 the buffer on shutdown. Disk full or slow downstream applies backpressure to
 the request path.
 
+## OIDC bearer tokens
+
+Production deployments often need IdP-signed JWTs instead of static bearer tokens (Okta, Auth0, Azure AD, Keycloak, Google). Configure the four OIDC flags:
+
+```
+-oidc-jwks-url https://idp.example.com/.well-known/jwks.json
+-oidc-issuer https://idp.example.com
+-oidc-audience potent
+-oidc-caller-claim sub          # default; can be email, preferred_username, etc.
+-oidc-refresh-interval 1h       # how often to re-fetch the JWKS
+```
+
+When `-oidc-jwks-url` is set, inbound bearers are parsed as JWTs, verified against the IdP's published public keys, and gated on `iss`/`aud`/`exp`/`nbf` claims. The configured caller claim is extracted and attached to the request context exactly like the static-token path so per-tool `allowed_callers` ACLs work without change.
+
+Algorithms accepted: RS256, RS384, RS512, ES256, ES384, ES512. The `none` algorithm is explicitly rejected. A 30-second clock-skew tolerance is built in.
+
+The JWKS is fetched at startup, cached, and refreshed in the background at `-oidc-refresh-interval`. Network failures during refresh are logged but the cached keys keep working; if no keys are cached yet and the first fetch fails, every request will 401 until the next refresh succeeds.
+
 ## PII redaction
 
 Two per-tool policy fields keep sensitive bytes off disk while preserving the dedup behavior:
