@@ -33,7 +33,7 @@ func TestApply_StrictReplaysExactDuplicate(t *testing.T) {
 		return 200, []byte(`{"id":"x"}`), nil
 	}
 
-	res1, err := pl.Apply(context.Background(), "send_email", []byte(`{"to":"a@b.com"}`), forward)
+	res1, err := pl.Apply(context.Background(), "send_email", "", []byte(`{"to":"a@b.com"}`), forward)
 	if err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestApply_StrictReplaysExactDuplicate(t *testing.T) {
 		t.Errorf("first decision = %v, want Forward", res1.Decision)
 	}
 
-	res2, err := pl.Apply(context.Background(), "send_email", []byte(`{"to":"a@b.com"}`), forward)
+	res2, err := pl.Apply(context.Background(), "send_email", "", []byte(`{"to":"a@b.com"}`), forward)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
@@ -64,8 +64,8 @@ func TestApply_OffModeAlwaysForwards(t *testing.T) {
 		calls++
 		return 200, []byte("ok"), nil
 	}
-	_, _ = pl.Apply(context.Background(), "t", []byte(`{"x":1}`), forward)
-	_, _ = pl.Apply(context.Background(), "t", []byte(`{"x":1}`), forward)
+	_, _ = pl.Apply(context.Background(), "t", "", []byte(`{"x":1}`), forward)
+	_, _ = pl.Apply(context.Background(), "t", "", []byte(`{"x":1}`), forward)
 	if calls != 2 {
 		t.Errorf("off mode should forward both, got %d", calls)
 	}
@@ -74,7 +74,7 @@ func TestApply_OffModeAlwaysForwards(t *testing.T) {
 func TestApply_InvalidJSONErrors(t *testing.T) {
 	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"t": {Mode: policy.ModeStrict, TTL: time.Hour}}}
 	pl := New(cfg, store.NewMemory(nil))
-	_, err := pl.Apply(context.Background(), "t", []byte("not json"), func(ctx context.Context) (int, []byte, error) {
+	_, err := pl.Apply(context.Background(), "t", "", []byte("not json"), func(ctx context.Context) (int, []byte, error) {
 		return 200, nil, nil
 	})
 	if err == nil {
@@ -97,10 +97,10 @@ func TestApply_SemanticReplay(t *testing.T) {
 	first := `{"to":"alice@example.com","subject":"Q3","body":"Please find attached the Q3 financial report for your review."}`
 	near := `{"to":"alice@example.com","subject":"Q3","body":"Please find attached the Q3 financial report for review."}`
 
-	_, _ = pl.Apply(context.Background(), "email", []byte(first), func(ctx context.Context) (int, []byte, error) {
+	_, _ = pl.Apply(context.Background(), "email", "", []byte(first), func(ctx context.Context) (int, []byte, error) {
 		return 200, []byte(`{"id":1}`), nil
 	})
-	res, err := pl.Apply(context.Background(), "email", []byte(near), func(ctx context.Context) (int, []byte, error) {
+	res, err := pl.Apply(context.Background(), "email", "", []byte(near), func(ctx context.Context) (int, []byte, error) {
 		t.Errorf("forward should not be called for semantic replay")
 		return 200, nil, nil
 	})
@@ -123,10 +123,10 @@ func TestApply_BlockOnRequireHumanConfirm(t *testing.T) {
 	}}
 	pl := New(cfg, store.NewMemory(nil))
 	body := []byte(`{"user_id":"42"}`)
-	_, _ = pl.Apply(context.Background(), "delete_user", body, func(ctx context.Context) (int, []byte, error) {
+	_, _ = pl.Apply(context.Background(), "delete_user", "", body, func(ctx context.Context) (int, []byte, error) {
 		return 200, []byte(`{"deleted":true}`), nil
 	})
-	res, err := pl.Apply(context.Background(), "delete_user", body, func(ctx context.Context) (int, []byte, error) {
+	res, err := pl.Apply(context.Background(), "delete_user", "", body, func(ctx context.Context) (int, []byte, error) {
 		t.Errorf("forward should not be called when blocking")
 		return 200, nil, nil
 	})
@@ -143,7 +143,7 @@ func TestLookup_ReturnsForwardOnMiss(t *testing.T) {
 		"t": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"x"}},
 	}}
 	pl := New(cfg, store.NewMemory(nil))
-	res, intent, err := pl.Lookup(context.Background(), "t", []byte(`{"x":1}`))
+	res, intent, err := pl.Lookup(context.Background(), "t", "", []byte(`{"x":1}`))
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestLookup_ReturnsForwardOnMiss(t *testing.T) {
 func TestLookup_OffMode(t *testing.T) {
 	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"t": {Mode: policy.ModeOff}}}
 	pl := New(cfg, store.NewMemory(nil))
-	res, _, err := pl.Lookup(context.Background(), "t", []byte(`{"x":1}`))
+	res, _, err := pl.Lookup(context.Background(), "t", "", []byte(`{"x":1}`))
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestLookup_OffMode(t *testing.T) {
 func TestLookup_InvalidJSON(t *testing.T) {
 	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"t": {Mode: policy.ModeStrict, TTL: time.Hour}}}
 	pl := New(cfg, store.NewMemory(nil))
-	if _, _, err := pl.Lookup(context.Background(), "t", []byte("not json")); err == nil {
+	if _, _, err := pl.Lookup(context.Background(), "t", "", []byte("not json")); err == nil {
 		t.Errorf("expected error for invalid JSON")
 	}
 }
@@ -189,7 +189,7 @@ func TestCache_StoresSuccessResponse(t *testing.T) {
 		t.Fatalf("Cache: %v", err)
 	}
 
-	res, _, _ := pl.Lookup(context.Background(), "t", body)
+	res, _, _ := pl.Lookup(context.Background(), "t", "", body)
 	if res.Decision != DecisionReplay {
 		t.Errorf("expected cached entry replays, got %v", res.Decision)
 	}
@@ -203,7 +203,7 @@ func TestCache_SkipsNon2xx(t *testing.T) {
 	if err := pl.Cache(context.Background(), "t", []byte(`{"x":1}`), 500, []byte(`fail`)); err != nil {
 		t.Fatalf("Cache: %v", err)
 	}
-	res, _, _ := pl.Lookup(context.Background(), "t", []byte(`{"x":1}`))
+	res, _, _ := pl.Lookup(context.Background(), "t", "", []byte(`{"x":1}`))
 	if res.Decision != DecisionForward {
 		t.Errorf("5xx should not be cached, got %v", res.Decision)
 	}
@@ -223,7 +223,7 @@ func TestWithMetricsOption(t *testing.T) {
 	}}
 	m := metricsTestRegistry(t)
 	pl := New(cfg, store.NewMemory(nil), WithMetrics(m))
-	_, err := pl.Apply(context.Background(), "t", []byte(`{"x":1}`), func(ctx context.Context) (int, []byte, error) {
+	_, err := pl.Apply(context.Background(), "t", "", []byte(`{"x":1}`), func(ctx context.Context) (int, []byte, error) {
 		return 200, []byte(`{"ok":true}`), nil
 	})
 	if err != nil {
@@ -268,8 +268,8 @@ func TestApply_LogOnlyForwardsButChecksCache(t *testing.T) {
 		calls++
 		return 200, []byte("ok"), nil
 	}
-	_, _ = pl.Apply(context.Background(), "t", []byte(`{"x":1}`), forward)
-	_, _ = pl.Apply(context.Background(), "t", []byte(`{"x":1}`), forward)
+	_, _ = pl.Apply(context.Background(), "t", "", []byte(`{"x":1}`), forward)
+	_, _ = pl.Apply(context.Background(), "t", "", []byte(`{"x":1}`), forward)
 	if calls != 2 {
 		t.Errorf("log_only must forward both, got %d", calls)
 	}
@@ -280,9 +280,85 @@ func TestBuildIntent_HandlesScalarTypes(t *testing.T) {
 		"t": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"s", "n", "b", "z"}},
 	}}, store.NewMemory(nil))
 	// Exercise writeScalar across all branches.
-	_, _ = pl.Apply(context.Background(), "t", []byte(`{"s":"x","n":3.14,"b":true,"z":null}`), func(ctx context.Context) (int, []byte, error) {
+	_, _ = pl.Apply(context.Background(), "t", "", []byte(`{"s":"x","n":3.14,"b":true,"z":null}`), func(ctx context.Context) (int, []byte, error) {
 		return 200, []byte("ok"), nil
 	})
+}
+
+func TestApply_ForbidsCallerNotInAllowList(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			AllowedCallers:    []string{"team-eng", "team-finance"},
+		},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+	forward := func(ctx context.Context) (int, []byte, error) {
+		t.Errorf("forward should not be called when caller is forbidden")
+		return 0, nil, nil
+	}
+
+	r, err := pl.Apply(context.Background(), "send_email", "team-marketing", []byte(`{"to":"a@b.com"}`), forward)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if r.Decision != DecisionForbidden || r.StatusCode != 403 {
+		t.Errorf("got %v/%d, want Forbidden/403", r.Decision, r.StatusCode)
+	}
+}
+
+func TestApply_AllowsCallerInAllowList(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			AllowedCallers:    []string{"team-eng"},
+		},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+	calls := 0
+	forward := func(ctx context.Context) (int, []byte, error) {
+		calls++
+		return 200, []byte("{}"), nil
+	}
+	r, err := pl.Apply(context.Background(), "send_email", "team-eng", []byte(`{"to":"a@b.com"}`), forward)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if r.Decision != DecisionForward {
+		t.Errorf("allowed caller should forward, got %v", r.Decision)
+	}
+	if calls != 1 {
+		t.Errorf("forward not called")
+	}
+}
+
+func TestApply_EmptyAllowListMeansAnyCaller(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+	forward := func(ctx context.Context) (int, []byte, error) { return 200, []byte("{}"), nil }
+
+	// no caller (anonymous, single-token mode)
+	r, _ := pl.Apply(context.Background(), "send_email", "", []byte(`{"to":"a@b.com"}`), forward)
+	if r.Decision != DecisionForward {
+		t.Errorf("anonymous caller with empty allow list should forward, got %v", r.Decision)
+	}
+	// arbitrary caller (multi-tenant with no per-tool gate)
+	r, _ = pl.Apply(context.Background(), "send_email", "team-marketing", []byte(`{"to":"b@b.com"}`), forward)
+	if r.Decision != DecisionForward {
+		t.Errorf("arbitrary caller with empty allow list should forward, got %v", r.Decision)
+	}
+}
+
+func TestDecision_ForbiddenString(t *testing.T) {
+	if DecisionForbidden.String() != "forbidden" {
+		t.Errorf("got %q", DecisionForbidden.String())
+	}
 }
 
 func TestApply_RateLimitReturns429WhenExceeded(t *testing.T) {
@@ -302,14 +378,14 @@ func TestApply_RateLimitReturns429WhenExceeded(t *testing.T) {
 	// burst is 1, so the second back-to-back call exceeds the limit
 	body1 := []byte(`{"to":"a@b.com"}`)
 	body2 := []byte(`{"to":"b@b.com"}`) // different intent so the cache does not absorb it
-	r1, err := pl.Apply(context.Background(), "send_email", body1, forward)
+	r1, err := pl.Apply(context.Background(), "send_email", "", body1, forward)
 	if err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
 	if r1.Decision != DecisionForward {
 		t.Errorf("first call should pass through, got %v", r1.Decision)
 	}
-	r2, err := pl.Apply(context.Background(), "send_email", body2, forward)
+	r2, err := pl.Apply(context.Background(), "send_email", "", body2, forward)
 	if err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
@@ -333,7 +409,7 @@ func TestApply_RateLimitZeroDisablesCheck(t *testing.T) {
 	}
 	for i := 0; i < 100; i++ {
 		body := []byte(fmt.Sprintf(`{"to":"caller-%d@b.com"}`, i))
-		_, _ = pl.Apply(context.Background(), "send_email", body, forward)
+		_, _ = pl.Apply(context.Background(), "send_email", "", body, forward)
 	}
 	if calls != 100 {
 		t.Errorf("RPS=0 should disable rate limiting; got %d forwards out of 100", calls)
@@ -382,7 +458,7 @@ func TestApply_LeaderPanicDoesNotDeadlockWaiters(t *testing.T) {
 					results[i] = outcome{err: fmt.Errorf("propagated panic: %v", r)}
 				}
 			}()
-			res, err := pl.Apply(context.Background(), "send_email", body, forward)
+			res, err := pl.Apply(context.Background(), "send_email", "", body, forward)
 			results[i] = outcome{res: res, err: err}
 		}(i)
 	}
@@ -436,7 +512,7 @@ func TestApply_CoalescesConcurrentDuplicates(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			res, _ := pl.Apply(context.Background(), "send_email", body, forward)
+			res, _ := pl.Apply(context.Background(), "send_email", "", body, forward)
 			results[i] = res
 		}(i)
 	}

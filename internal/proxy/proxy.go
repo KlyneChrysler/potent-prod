@@ -9,6 +9,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,7 +38,22 @@ type Proxy struct {
 	upstrURL     *url.URL
 	logger       *slog.Logger
 	maxBodyBytes int64
-	apiToken     string
+
+	// Single-token auth (POTENT_API_TOKEN). When set, every caller is
+	// treated as anonymous and per-tool ACLs cannot enforce caller
+	// identity. Used by simple single-tenant deployments.
+	apiToken string
+
+	// Multi-tenant auth: map of token -> caller-id. When non-empty, takes
+	// precedence over apiToken; the matched caller-id is attached to the
+	// request context so the pipeline can enforce per-tool ACLs and the
+	// audit log can record who made the call.
+	apiTokens map[string]string
+
+	// upstreamTLS, when non-nil, is applied to the reverse-proxy transport
+	// so the connection to upstream uses a custom CA pool, client cert,
+	// or insecure-skip-verify per operator policy.
+	upstreamTLS *tls.Config
 }
 
 // Option configures a Proxy at construction time.
@@ -56,6 +72,20 @@ func WithAPIToken(token string) Option {
 	return func(p *Proxy) { p.apiToken = token }
 }
 
+// WithAPITokensFile installs a multi-tenant token map. Each request's
+// bearer is looked up against the map and the matching caller-id is
+// attached to the request context for ACL enforcement and audit logging.
+// When supplied with a non-empty map, takes precedence over WithAPIToken.
+func WithAPITokensFile(tokens map[string]string) Option {
+	return func(p *Proxy) { p.apiTokens = tokens }
+}
+
+// WithUpstreamTLS swaps the reverse-proxy transport with one configured
+// from cfg. Pass nil for the default (system trust store, no client cert).
+func WithUpstreamTLS(cfg *tls.Config) Option {
+	return func(p *Proxy) { p.upstreamTLS = cfg }
+}
+
 // New constructs an HTTP-mode proxy.
 func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...Option) *Proxy {
 	if logger == nil {
@@ -71,13 +101,25 @@ func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...
 	for _, opt := range opts {
 		opt(p)
 	}
+	// Apply upstream TLS to the reverse-proxy transport if configured.
+	// The default transport carries CGO-DNS, dual-stack dial, etc., so we
+	// clone it and only override TLSClientConfig.
+	if p.upstreamTLS != nil {
+		tp := http.DefaultTransport.(*http.Transport).Clone()
+		tp.TLSClientConfig = p.upstreamTLS
+		p.upstream.Transport = tp
+	}
 	return p
 }
 
 // Handler returns the proxy wrapped with bearer-token auth when an API
 // token is configured. Mount this rather than the bare Proxy on the
 // public-facing ServeMux so the token check runs ahead of every request.
+// Multi-tenant (apiTokens) takes precedence over single-token (apiToken).
 func (p *Proxy) Handler() http.Handler {
+	if len(p.apiTokens) > 0 {
+		return auth.RequireBearerCallers(p.apiTokens, "potent", p)
+	}
 	return auth.RequireBearer(p.apiToken, "potent", p)
 }
 
@@ -109,7 +151,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return rec.status, rec.body.Bytes(), nil
 	}
 
-	res, err := p.pipeline.Apply(r.Context(), tool, body, forward)
+	caller := auth.CallerFromContext(r.Context())
+	res, err := p.pipeline.Apply(r.Context(), tool, caller, body, forward)
 	if err != nil {
 		p.logger.Warn("pipeline apply", "err", err, "tool", tool)
 		http.Error(w, "pipeline error", http.StatusInternalServerError)
@@ -126,6 +169,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("X-Potent-Hash", res.Hash)
 	switch res.Decision {
+	case pipeline.DecisionForbidden:
+		http.Error(w, "tool not allowed for caller", http.StatusForbidden)
+		return
 	case pipeline.DecisionRateLimited:
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)

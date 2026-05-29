@@ -24,6 +24,28 @@ type ToolPolicy struct {
 	// buggy agent in a retry loop cannot saturate the gateway even with
 	// requests that would have been deduped. Zero (RPS=0) disables.
 	RateLimit RateLimit `yaml:"rate_limit"`
+
+	// AllowedCallers, when non-empty, restricts which authenticated callers
+	// may invoke this tool. The caller-id (set by auth middleware via the
+	// tokens file) must appear in this list or the request is rejected
+	// with 403. An empty list (the default) means any authenticated caller
+	// may invoke the tool, which matches single-token deployments.
+	AllowedCallers []string `yaml:"allowed_callers"`
+}
+
+// AllowsCaller reports whether the named caller may invoke this tool. An
+// empty AllowedCallers list means every authenticated caller is permitted
+// (the simple, single-tenant default).
+func (p ToolPolicy) AllowsCaller(caller string) bool {
+	if len(p.AllowedCallers) == 0 {
+		return true
+	}
+	for _, c := range p.AllowedCallers {
+		if c == caller {
+			return true
+		}
+	}
+	return false
 }
 
 // RateLimit is the token-bucket configuration for a single tool. RPS is

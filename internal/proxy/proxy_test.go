@@ -231,6 +231,51 @@ func TestProxy_RequiresBearerWhenTokenSet(t *testing.T) {
 	}
 }
 
+func TestProxy_PerToolACL_RejectsForbiddenCaller(t *testing.T) {
+	var calls int32
+	upstream := makeUpstream(t, &calls, `{"ok":true}`)
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			AllowedCallers:    []string{"team-eng"},
+		},
+	}}
+	u, _ := url.Parse(upstream.URL)
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	p := New(pl, u, nil, WithAPITokensFile(map[string]string{
+		"tok-eng":       "team-eng",
+		"tok-marketing": "team-marketing",
+	}))
+	h := p.Handler()
+
+	body := `{"to":"alice@example.com","subject":"Q3","body":"hi"}`
+
+	// team-marketing must be rejected
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body))
+	r.Header.Set(ToolHeader, "send_email")
+	r.Header.Set("Authorization", "Bearer tok-marketing")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusForbidden {
+		t.Errorf("forbidden caller: status = %d, want 403", w.Result().StatusCode)
+	}
+
+	// team-eng must pass through
+	r = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(body))
+	r.Header.Set(ToolHeader, "send_email")
+	r.Header.Set("Authorization", "Bearer tok-eng")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("allowed caller: status = %d, want 200", w.Result().StatusCode)
+	}
+	if atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("upstream calls = %d, want exactly 1", atomic.LoadInt32(&calls))
+	}
+}
+
 func TestProxy_RateLimitReturns429(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true}`)
