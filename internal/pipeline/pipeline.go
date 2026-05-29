@@ -14,10 +14,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"github.com/potent/potent/internal/audit"
 	"github.com/potent/potent/internal/embed"
@@ -35,6 +38,7 @@ const (
 	DecisionForward Decision = iota
 	DecisionReplay
 	DecisionBlock
+	DecisionRateLimited
 )
 
 func (d Decision) String() string {
@@ -45,6 +49,8 @@ func (d Decision) String() string {
 		return "replay"
 	case DecisionBlock:
 		return "block"
+	case DecisionRateLimited:
+		return "rate_limited"
 	}
 	return "unknown"
 }
@@ -89,6 +95,11 @@ type Pipeline struct {
 	// duplicate. Without coalescing, three concurrent identical tool calls
 	// would all reach upstream, defeating the whole point of idempotency.
 	inflight map[string]*applyInflight
+
+	// rlMu guards limiters; entries are created lazily on first Apply
+	// for a tool that has a non-zero rate limit configured.
+	rlMu     sync.Mutex
+	limiters map[string]*rate.Limiter
 }
 
 // applyInflight is what concurrent siblings of a leader Apply call wait on.
@@ -107,11 +118,36 @@ func New(p *policy.Config, st store.Store, opts ...Option) *Pipeline {
 		store:    st,
 		now:      time.Now,
 		inflight: make(map[string]*applyInflight),
+		limiters: make(map[string]*rate.Limiter),
 	}
 	for _, opt := range opts {
 		opt(pl)
 	}
 	return pl
+}
+
+// limiterFor returns the token-bucket limiter for tool, creating it lazily
+// from policy on first use. Returns nil if rate limiting is disabled for
+// the tool (RPS <= 0).
+func (p *Pipeline) limiterFor(tool string, rl policy.RateLimit) *rate.Limiter {
+	if rl.RPS <= 0 {
+		return nil
+	}
+	p.rlMu.Lock()
+	defer p.rlMu.Unlock()
+	if l, ok := p.limiters[tool]; ok {
+		return l
+	}
+	burst := rl.Burst
+	if burst <= 0 {
+		burst = int(math.Ceil(rl.RPS))
+		if burst < 1 {
+			burst = 1
+		}
+	}
+	l := rate.NewLimiter(rate.Limit(rl.RPS), burst)
+	p.limiters[tool] = l
+	return l
 }
 
 // Option configures the Pipeline.
@@ -123,8 +159,9 @@ func WithClock(c func() time.Time) Option   { return func(p *Pipeline) { p.now =
 func WithAudit(a *audit.Writer) Option      { return func(p *Pipeline) { p.audit = a } }
 
 // Lookup evaluates policy + cache without calling upstream. Returns the
-// decision (Replay/Block/Forward), the cached entry if applicable, and the
-// hash/intent the caller needs to later store a fresh response.
+// decision (Replay/Block/Forward/RateLimited), the cached entry if
+// applicable, and the hash/intent the caller needs to later store a fresh
+// response.
 //
 // Forward callers (HTTP, MCP-HTTP) typically use Apply; bidirectional
 // transports (MCP stdio) split lookup from caching because the response
@@ -133,6 +170,12 @@ func (p *Pipeline) Lookup(ctx context.Context, tool string, body []byte) (Result
 	pol := p.policies.For(tool)
 	if pol.Mode == policy.ModeOff {
 		return Result{Decision: DecisionForward}, "", nil
+	}
+
+	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
+		p.recordDecision(tool, pol.Mode, DecisionRateLimited)
+		p.writeAudit(tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
+		return Result{Decision: DecisionRateLimited, StatusCode: 429}, "", nil
 	}
 
 	hash, intent, err := analyse(body, pol)
@@ -209,6 +252,12 @@ func (p *Pipeline) Apply(ctx context.Context, tool string, body []byte, forward 
 	if pol.Mode == policy.ModeOff {
 		status, resp, err := forward(ctx)
 		return Result{Decision: DecisionForward, StatusCode: status, Body: resp}, err
+	}
+
+	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
+		p.recordDecision(tool, pol.Mode, DecisionRateLimited)
+		p.writeAudit(tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
+		return Result{Decision: DecisionRateLimited, StatusCode: 429}, nil
 	}
 
 	hash, intent, err := analyse(body, pol)

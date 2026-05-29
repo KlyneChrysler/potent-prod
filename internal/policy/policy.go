@@ -18,6 +18,20 @@ type ToolPolicy struct {
 	FingerprintFields           []string            `yaml:"fingerprint_fields"`
 	SemanticThreshold           float64             `yaml:"semantic_threshold"`
 	RequireHumanConfirmOnReplay bool                `yaml:"require_human_confirm_on_replay"`
+
+	// RateLimit caps the rate at which tool calls reach the upstream from
+	// this potent instance. The check fires before the cache lookup so a
+	// buggy agent in a retry loop cannot saturate the gateway even with
+	// requests that would have been deduped. Zero (RPS=0) disables.
+	RateLimit RateLimit `yaml:"rate_limit"`
+}
+
+// RateLimit is the token-bucket configuration for a single tool. RPS is
+// the steady-state rate; Burst is the maximum allowance for a brief spike
+// (defaults to RPS rounded up when unset).
+type RateLimit struct {
+	RPS   float64 `yaml:"rps"`
+	Burst int     `yaml:"burst"`
 }
 
 type Config struct {

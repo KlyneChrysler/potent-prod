@@ -94,6 +94,30 @@ func parse(src string) (*Config, error) {
 			}
 			tp.Normalize[field] = parseInlineList(val)
 			cfg.Tools[stack[len(stack)-1].tool] = tp
+		case len(stack) > 0 && stack[len(stack)-1].kind == "rate_limit":
+			field, val, ok := splitKV(trim)
+			if !ok {
+				return nil, fmt.Errorf("line %d: expected key: value in rate_limit block", i+1)
+			}
+			tool := stack[len(stack)-1].tool
+			tp := cfg.Tools[tool]
+			switch field {
+			case "rps":
+				f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+				if err != nil {
+					return nil, fmt.Errorf("line %d: rate_limit.rps: %w", i+1, err)
+				}
+				tp.RateLimit.RPS = f
+			case "burst":
+				n, err := strconv.Atoi(strings.TrimSpace(val))
+				if err != nil {
+					return nil, fmt.Errorf("line %d: rate_limit.burst: %w", i+1, err)
+				}
+				tp.RateLimit.Burst = n
+			default:
+				return nil, fmt.Errorf("line %d: unknown rate_limit key %q", i+1, field)
+			}
+			cfg.Tools[tool] = tp
 		default:
 			return nil, fmt.Errorf("line %d: unexpected token %q", i+1, trim)
 		}
@@ -107,6 +131,10 @@ func applyScalarOrOpenBlock(cfg *Config, stack *[]stackFrame, trim string, inden
 
 	if trim == "normalize:" {
 		*stack = append(*stack, stackFrame{indent: indent, kind: "normalize", tool: top.tool})
+		return nil
+	}
+	if trim == "rate_limit:" {
+		*stack = append(*stack, stackFrame{indent: indent, kind: "rate_limit", tool: top.tool})
 		return nil
 	}
 
@@ -160,7 +188,7 @@ func writePolicy(cfg *Config, frame stackFrame, p ToolPolicy) {
 }
 
 // stackFrame represents an open block in the YAML parser.
-// kind is one of: "defaults", "tools", "tool", "normalize".
+// kind is one of: "defaults", "tools", "tool", "normalize", "rate_limit".
 type stackFrame struct {
 	indent int
 	kind   string
