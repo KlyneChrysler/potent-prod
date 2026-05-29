@@ -94,7 +94,25 @@ Sends are buffered through a 1024-deep channel; the writer goroutine drains
 the buffer on shutdown. Disk full or slow downstream applies backpressure to
 the request path.
 
-## Tracing
+## PII redaction
+
+Two per-tool policy fields keep sensitive bytes off disk while preserving the dedup behavior:
+
+```yaml
+tools:
+  charge_card:
+    mode: strict
+    fingerprint_fields: [customer_id, amount_cents, currency]
+    replay_strategy: synthesized_ack
+    synthesized_response: '{"already_charged":true,"hash":"$hash"}'
+    redact_request_body: true
+```
+
+- `replay_strategy: synthesized_ack` tells potent never to store the upstream response body. On a duplicate, the configured template is returned instead. `$hash` and `$tool` are expanded. Default is `cached_response` (original byte-for-byte replay).
+- `redact_request_body: true` stores `nil` for the raw inbound bytes. The fingerprint (one-way SHA-256) still records the canonical intent so dedupe keeps working; only the admin debug view and any post-mortem disk dump lose signal.
+
+Together these eliminate the two paths through which PII can reach the on-disk cache. Verified by scanning the bolt file in tests; sensitive strings from the upstream response and the request never appear.
+
 
 potent speaks the [W3C Trace Context](https://www.w3.org/TR/trace-context/) `traceparent` header on every HTTP and MCP HTTP request:
 
