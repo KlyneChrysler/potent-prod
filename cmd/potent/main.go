@@ -11,6 +11,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -67,9 +69,18 @@ func run() error {
 	maxBodyBytes := flag.Int64("max-body-bytes", 1<<20, "cap on inbound tool-call request bodies (0 = unlimited; recommend leaving the default)")
 	stdioTimeout := flag.Duration("stdio-request-timeout", 60*time.Second, "how long an in-flight mcp-stdio tools/call may wait for a response before being treated as failed")
 	compactInterval := flag.Duration("bolt-compact-interval", time.Hour, "how often the bolt store sweeps expired entries from disk (0 = disabled)")
+	tokensFile := flag.String("api-tokens-file", "", "YAML file mapping caller-id -> bearer token; enables per-tool ACLs (overrides POTENT_API_TOKEN when set)")
+	upstreamCA := flag.String("upstream-ca", "", "PEM file with extra CAs trusted for upstream TLS (defaults to system trust store)")
+	upstreamCert := flag.String("upstream-cert", "", "PEM file with client certificate for mTLS to upstream")
+	upstreamKey := flag.String("upstream-key", "", "PEM file with client private key for mTLS to upstream")
+	upstreamSkipVerify := flag.Bool("upstream-insecure-skip-verify", false, "skip upstream TLS verification (testing only; never enable in production)")
 	flag.Parse()
 
 	apiToken := os.Getenv("POTENT_API_TOKEN")
+	apiTokens, err := loadAPITokens(*tokensFile)
+	if err != nil {
+		return fmt.Errorf("load -api-tokens-file: %w", err)
+	}
 
 	adminToken := os.Getenv("POTENT_ADMIN_TOKEN")
 
@@ -156,15 +167,20 @@ func run() error {
 	// Refuse to start an unauthenticated proxy listener on a non-loopback
 	// address. mcp-stdio is single-tenant (the client and child share the
 	// parent process) so the check does not apply.
-	if (*mode == "http" || *mode == "mcp-http") && apiToken == "" && !isLoopbackBind(*addr) {
-		return fmt.Errorf("refusing to expose unauthenticated proxy on %q; set POTENT_API_TOKEN or bind -addr to loopback", *addr)
+	if (*mode == "http" || *mode == "mcp-http") && apiToken == "" && len(apiTokens) == 0 && !isLoopbackBind(*addr) {
+		return fmt.Errorf("refusing to expose unauthenticated proxy on %q; set POTENT_API_TOKEN, supply -api-tokens-file, or bind -addr to loopback", *addr)
+	}
+
+	tlsCfg, err := buildUpstreamTLS(*upstreamCA, *upstreamCert, *upstreamKey, *upstreamSkipVerify, logger)
+	if err != nil {
+		return fmt.Errorf("upstream tls: %w", err)
 	}
 
 	switch *mode {
 	case "http":
-		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken)
+		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken, apiTokens, tlsCfg)
 	case "mcp-http":
-		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken)
+		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken, apiTokens, tlsCfg)
 	case "mcp-stdio":
 		return runMCPStdio(*upstream, pl, logger, *stdioTimeout)
 	default:
@@ -172,21 +188,27 @@ func run() error {
 	}
 }
 
-func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string) error {
+func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string, apiTokens map[string]string, tlsCfg *tls.Config) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	p := proxy.New(pl, u, logger, proxy.WithMaxBodyBytes(maxBody), proxy.WithAPIToken(apiToken))
+	opts := []proxy.Option{proxy.WithMaxBodyBytes(maxBody), proxy.WithAPIToken(apiToken), proxy.WithAPITokensFile(apiTokens), proxy.WithUpstreamTLS(tlsCfg)}
+	p := proxy.New(pl, u, logger, opts...)
 	return serveDual(addr, metricsAddr, p.Handler(), m, "http", upstream, logger)
 }
 
-func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string) error {
+func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string, apiTokens map[string]string, tlsCfg *tls.Config) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	h := mcp.NewHTTPHandler(pl, u, logger, mcp.WithHTTPMaxBodyBytes(maxBody), mcp.WithHTTPAPIToken(apiToken))
+	h := mcp.NewHTTPHandler(pl, u, logger,
+		mcp.WithHTTPMaxBodyBytes(maxBody),
+		mcp.WithHTTPAPIToken(apiToken),
+		mcp.WithHTTPAPITokensFile(apiTokens),
+		mcp.WithHTTPUpstreamTLS(tlsCfg),
+	)
 	return serveDual(addr, metricsAddr, h.Handler(), m, "mcp-http", upstream, logger)
 }
 
@@ -279,6 +301,87 @@ func isLoopbackBind(addr string) bool {
 		return true
 	}
 	return false
+}
+
+// loadAPITokens parses a YAML file mapping caller-id -> bearer token. The
+// minimal parser accepts `caller-id: token-value` per line; comments and
+// blank lines are ignored. Returns an empty map when path is "".
+func loadAPITokens(path string) (map[string]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path) // #nosec G304 -- operator-supplied path
+	if err != nil {
+		return nil, fmt.Errorf("read %q: %w", path, err)
+	}
+	tokens := map[string]string{}
+	for i, raw := range strings.Split(string(b), "\n") {
+		line := raw
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		colon := strings.Index(line, ":")
+		if colon <= 0 {
+			return nil, fmt.Errorf("%s line %d: expected `caller-id: token`", path, i+1)
+		}
+		caller := strings.TrimSpace(line[:colon])
+		token := strings.TrimSpace(line[colon+1:])
+		if caller == "" || token == "" {
+			return nil, fmt.Errorf("%s line %d: empty caller or token", path, i+1)
+		}
+		if _, dup := tokens[token]; dup {
+			return nil, fmt.Errorf("%s line %d: duplicate token", path, i+1)
+		}
+		tokens[token] = caller
+	}
+	return tokens, nil
+}
+
+// buildUpstreamTLS constructs a *tls.Config from the supplied PEM paths.
+// Returns nil when no TLS options were set so callers can pass the result
+// to the HTTP client without further checks. A custom CA expands rather
+// than replaces the system trust store.
+func buildUpstreamTLS(caPath, certPath, keyPath string, skipVerify bool, logger *slog.Logger) (*tls.Config, error) {
+	if caPath == "" && certPath == "" && keyPath == "" && !skipVerify {
+		return nil, nil
+	}
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	if skipVerify {
+		logger.Warn("upstream tls verification disabled; never use in production", "flag", "-upstream-insecure-skip-verify")
+		cfg.InsecureSkipVerify = true // #nosec G402 -- operator opted in via flag
+	}
+
+	if caPath != "" {
+		pem, err := os.ReadFile(caPath) // #nosec G304 -- operator-supplied path
+		if err != nil {
+			return nil, fmt.Errorf("read ca %q: %w", caPath, err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("ca file %q contained no certificates", caPath)
+		}
+		cfg.RootCAs = pool
+	}
+
+	if (certPath == "") != (keyPath == "") {
+		return nil, errors.New("-upstream-cert and -upstream-key must be supplied together")
+	}
+	if certPath != "" {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load client cert: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return cfg, nil
 }
 
 func openStore(backend, dbPath string, logger *slog.Logger) (store.Store, func(), error) {
