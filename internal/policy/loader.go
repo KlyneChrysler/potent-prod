@@ -166,6 +166,18 @@ func applyScalarOrOpenBlock(cfg *Config, stack *[]stackFrame, trim string, inden
 		tp.FingerprintFields = parseInlineList(val)
 	case "allowed_callers":
 		tp.AllowedCallers = parseInlineList(val)
+	case "replay_strategy":
+		v := strings.TrimSpace(val)
+		switch ReplayStrategy(v) {
+		case ReplayCachedResponse, ReplaySynthesizedAck, "":
+			tp.ReplayStrategy = ReplayStrategy(v)
+		default:
+			return fmt.Errorf("replay_strategy: unknown value %q (want cached_response or synthesized_ack)", v)
+		}
+	case "synthesized_response":
+		tp.SynthesizedResponse = strings.Trim(strings.TrimSpace(val), `"'`)
+	case "redact_request_body":
+		tp.RedactRequestBody = strings.TrimSpace(val) == "true"
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}
