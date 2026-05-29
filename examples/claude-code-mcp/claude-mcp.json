@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "email": {
+      "command": "potent",
+      "args": [
+        "-mode", "mcp-stdio",
+        "-policy", "/absolute/path/to/policy.yaml",
+        "-store", "bolt",
+        "-db", "/absolute/path/to/potent.db",
+        "-upstream", "python /absolute/path/to/fake_mcp_server.py"
+      ]
+    }
+  }
+}

@@ -5,10 +5,15 @@ Same shape as the OpenAI example, but the agent is a LangGraph state machine. La
 ## Layout
 
 ```
-graph.py        # LangGraph agent with a send_email node
-tool_server.py  # The tool (Python stdlib HTTP server, same as openai-python/)
-policy.yaml     # potent's idempotency policy
-requirements.txt
+graph.py         # LangGraph agent with a send_email node
+policy.yaml      # potent's idempotency policy
+requirements.txt # pinned Python deps (langgraph only; no LLM call in this example)
+```
+
+The tool server is shared with `../openai-python/tool_server.py`. Copy it in before running:
+
+```bash
+cp ../openai-python/tool_server.py .
 ```
 
 ## Run
@@ -16,16 +21,25 @@ requirements.txt
 ```bash
 pip install -r requirements.txt
 python tool_server.py &
+TOOL_PID=$!
 
 potent -mode http -addr :8080 -upstream http://localhost:8000 -policy policy.yaml &
+POTENT_PID=$!
 
-export OPENAI_API_KEY=sk-...
 export TOOL_URL=http://localhost:8080
 python graph.py
 ```
 
+`graph.py` makes no LLM call, so no `OPENAI_API_KEY` is needed.
+
 The `graph.py` script intentionally triggers a retry by raising the first time through the tool node. Without potent, you'd see two upstream calls. With potent, the second is replayed.
+
+## Cleanup
+
+```bash
+kill $TOOL_PID $POTENT_PID
+```
 
 ## Why this matters for LangGraph
 
-LangGraph (and most agent frameworks) make retries trivial — that's the point. But retries on side-effecting tool calls are dangerous unless the upstream is idempotent. Potent makes the upstream effectively idempotent without your tool's cooperation.
+LangGraph (and most agent frameworks) make retries trivial. That's the point. But retries on side-effecting tool calls are dangerous unless the upstream is idempotent. Potent makes the upstream effectively idempotent without your tool's cooperation.
