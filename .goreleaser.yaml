@@ -78,8 +78,10 @@ dockers:
   - id: potent-amd64
     image_templates:
       - "ghcr.io/klynechrysler/potent:{{ .Version }}-amd64"
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.release
     use: buildx
+    extra_files:
+      - configs/policy.yaml
     build_flag_templates:
       - "--platform=linux/amd64"
       - "--label=org.opencontainers.image.source=https://github.com/KlyneChrysler/potent-prod"
@@ -88,9 +90,11 @@ dockers:
   - id: potent-arm64
     image_templates:
       - "ghcr.io/klynechrysler/potent:{{ .Version }}-arm64"
-    dockerfile: Dockerfile
+    dockerfile: Dockerfile.release
     use: buildx
     goarch: arm64
+    extra_files:
+      - configs/policy.yaml
     build_flag_templates:
       - "--platform=linux/arm64"
       - "--label=org.opencontainers.image.source=https://github.com/KlyneChrysler/potent-prod"
