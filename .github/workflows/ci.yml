@@ -98,3 +98,26 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.3
       - name: govulncheck
         run: govulncheck ./...
+
+  semantic-eval:
+    name: semantic-eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build potent-eval
+        run: go build -o bin/potent-eval ./cmd/potent-eval
+      - name: run semantic eval and upload json
+        run: ./bin/potent-eval -dataset docs/eval/dataset.jsonl -policy docs/eval/policy.yaml -json > eval-results.json
+      - name: human-readable summary in the log
+        run: ./bin/potent-eval -dataset docs/eval/dataset.jsonl -policy docs/eval/policy.yaml
+      - name: upload eval results
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: semantic-eval-results
+          path: eval-results.json
+          retention-days: 30

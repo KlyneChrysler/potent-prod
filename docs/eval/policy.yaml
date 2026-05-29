@@ -1,0 +1,43 @@
+# Policy used by the semantic-eval harness. The normalize and
+# fingerprint_fields here are realistic defaults; the eval reports
+# precision/recall across thresholds so semantic_threshold is calibrated
+# rather than baked in.
+tools:
+  send_email:
+    mode: strict
+    ttl: 24h
+    normalize:
+      to: [lowercase, trim]
+      subject: [trim, collapse_whitespace]
+      body: [trim, collapse_whitespace]
+    fingerprint_fields: [to, subject, body]
+
+  charge_card:
+    mode: strict
+    ttl: 7d
+    normalize:
+      customer_id: [trim]
+      currency: [trim, lowercase]
+      memo: [trim, collapse_whitespace]
+    fingerprint_fields: [customer_id, amount_cents, currency, memo]
+
+  create_task:
+    mode: strict
+    ttl: 24h
+    normalize:
+      title: [trim, collapse_whitespace]
+      description: [trim, collapse_whitespace]
+      assignee: [lowercase, trim]
+    fingerprint_fields: [title, description, assignee, priority]
+
+  delete_user:
+    mode: strict
+    ttl: 7d
+    fingerprint_fields: [user_id]
+
+  search_web:
+    mode: cache
+    ttl: 5m
+    normalize:
+      query: [trim, collapse_whitespace]
+    fingerprint_fields: [query]
