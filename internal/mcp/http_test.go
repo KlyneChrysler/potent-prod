@@ -288,6 +288,27 @@ func TestMCPHTTP_UpstreamErrorSurfaces(t *testing.T) {
 	}
 }
 
+func TestMCPHTTP_RequiresBearerWhenTokenSet(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	u, _ := url.Parse("http://upstream.invalid")
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewHTTPHandler(pl, u, nil, WithHTTPAPIToken("s3cret")).Handler()
+
+	frame := map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "send_email", "arguments": map[string]any{"to": "a"}},
+	}
+	b, _ := json.Marshal(frame)
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("missing token: status = %d, want 401", w.Result().StatusCode)
+	}
+}
+
 func TestMCPHTTP_MalformedToolsCallReturnsError(t *testing.T) {
 	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"send_email": {Mode: policy.ModeStrict, TTL: time.Hour}}}
 	h, _ := newMCPHandler(t, cfg, "http://upstream.invalid")

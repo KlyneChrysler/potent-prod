@@ -203,6 +203,70 @@ func TestProxy_CacheModeReplays(t *testing.T) {
 	}
 }
 
+func TestProxy_RequiresBearerWhenTokenSet(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	u, _ := url.Parse("http://upstream.invalid")
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := New(pl, u, nil, WithAPIToken("s3cret")).Handler()
+
+	// no header
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"to":"a"}`))
+	r.Header.Set(ToolHeader, "send_email")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("missing token: status = %d, want 401", w.Result().StatusCode)
+	}
+
+	// wrong token
+	r = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"to":"a"}`))
+	r.Header.Set(ToolHeader, "send_email")
+	r.Header.Set("Authorization", "Bearer nope")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("wrong token: status = %d, want 401", w.Result().StatusCode)
+	}
+}
+
+func TestProxy_RateLimitReturns429(t *testing.T) {
+	var calls int32
+	upstream := makeUpstream(t, &calls, `{"ok":true}`)
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			RateLimit:         policy.RateLimit{RPS: 1, Burst: 1},
+		},
+	}}
+	u, _ := url.Parse(upstream.URL)
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	p := New(pl, u, nil)
+
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"to":"a@b.com"}`))
+	r.Header.Set(ToolHeader, "send_email")
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Result().StatusCode != 200 {
+		t.Fatalf("first should pass, got %d", w.Result().StatusCode)
+	}
+
+	// second different intent so cache does not absorb
+	r = httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"to":"b@b.com"}`))
+	r.Header.Set(ToolHeader, "send_email")
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusTooManyRequests {
+		t.Errorf("second should rate-limit, got %d", w.Result().StatusCode)
+	}
+	if w.Result().Header.Get("Retry-After") == "" {
+		t.Errorf("missing Retry-After header on 429")
+	}
+}
+
 func TestProxy_RejectsOversizedBody(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true}`)

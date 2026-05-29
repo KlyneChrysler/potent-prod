@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/pipeline"
 )
 
@@ -36,6 +37,7 @@ type Proxy struct {
 	upstrURL     *url.URL
 	logger       *slog.Logger
 	maxBodyBytes int64
+	apiToken     string
 }
 
 // Option configures a Proxy at construction time.
@@ -45,6 +47,13 @@ type Option func(*Proxy)
 // Pass 0 to disable the cap (not recommended).
 func WithMaxBodyBytes(n int64) Option {
 	return func(p *Proxy) { p.maxBodyBytes = n }
+}
+
+// WithAPIToken gates every request behind a constant-time bearer-token
+// check. An empty token disables auth. cmd/potent enforces the token at
+// startup when the proxy listens on a non-loopback address.
+func WithAPIToken(token string) Option {
+	return func(p *Proxy) { p.apiToken = token }
 }
 
 // New constructs an HTTP-mode proxy.
@@ -63,6 +72,13 @@ func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...
 		opt(p)
 	}
 	return p
+}
+
+// Handler returns the proxy wrapped with bearer-token auth when an API
+// token is configured. Mount this rather than the bare Proxy on the
+// public-facing ServeMux so the token check runs ahead of every request.
+func (p *Proxy) Handler() http.Handler {
+	return auth.RequireBearer(p.apiToken, "potent", p)
 }
 
 // ServeHTTP implements http.Handler.
@@ -110,6 +126,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("X-Potent-Hash", res.Hash)
 	switch res.Decision {
+	case pipeline.DecisionRateLimited:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
 	case pipeline.DecisionReplay:
 		w.Header().Set("X-Potent-Status", "replayed")
 		if res.Match.Kind != "" {
