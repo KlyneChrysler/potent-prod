@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/url"
 	"os/exec"
 	"strings"
 	"sync"
@@ -340,6 +341,59 @@ func TestStdio_ExpireAt_LeavesUnexpiredAlone(t *testing.T) {
 	}
 	if len(h.pending) != 1 || len(h.inflight) != 1 {
 		t.Errorf("unexpired entries were removed: pending=%d inflight=%d", len(h.pending), len(h.inflight))
+	}
+}
+
+func TestStdio_SweepExpired_FiresOnTick(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewStdioHandler(pl, "/nonexistent", nil, nil)
+	h.SetRequestTimeout(50 * time.Millisecond)
+
+	// inject a pending entry past its deadline so the very first tick removes it
+	h.pending["1"] = pendingCall{tool: "send_email", args: []byte(`{"to":"x"}`), hash: "hash-x", deadline: time.Now().Add(-time.Second)}
+	h.inflight["hash-x"] = &inflightCall{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := &bytes.Buffer{}
+	done := make(chan struct{})
+	go func() {
+		h.sweepExpired(ctx, out)
+		close(done)
+	}()
+
+	// wait long enough for the ticker (500 ms minimum)
+	time.Sleep(700 * time.Millisecond)
+	cancel()
+	<-done
+
+	if len(h.pending) != 0 {
+		t.Errorf("sweeper did not clear pending: %v", h.pending)
+	}
+	if out.Len() == 0 {
+		t.Errorf("sweeper did not write a timeout response")
+	}
+}
+
+func TestStdio_SetRequestTimeoutZeroDisablesSweeper(t *testing.T) {
+	cfg := &policy.Config{}
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewStdioHandler(pl, "/nonexistent", nil, nil)
+	h.SetRequestTimeout(0)
+	if h.requestTimeout != 0 {
+		t.Errorf("expected requestTimeout=0, got %v", h.requestTimeout)
+	}
+}
+
+func TestMCP_WithHTTPMaxBodyBytes(t *testing.T) {
+	pl := pipeline.New(&policy.Config{}, store.NewMemory(nil))
+	u, _ := url.Parse("http://upstream.invalid")
+	h := NewHTTPHandler(pl, u, nil, WithHTTPMaxBodyBytes(42))
+	if h.maxBodyBytes != 42 {
+		t.Errorf("maxBodyBytes = %d, want 42", h.maxBodyBytes)
 	}
 }
 

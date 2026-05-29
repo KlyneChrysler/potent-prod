@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -282,6 +283,69 @@ func TestBuildIntent_HandlesScalarTypes(t *testing.T) {
 	_, _ = pl.Apply(context.Background(), "t", []byte(`{"s":"x","n":3.14,"b":true,"z":null}`), func(ctx context.Context) (int, []byte, error) {
 		return 200, []byte("ok"), nil
 	})
+}
+
+func TestApply_LeaderPanicDoesNotDeadlockWaiters(t *testing.T) {
+	// If the leader's forward closure panics, every coalesced sibling waiting
+	// on its done channel must receive a clean error response instead of
+	// hanging forever or seeing a zero Result.
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+
+	release := make(chan struct{})
+	var leaderEntered int32
+	forward := func(ctx context.Context) (int, []byte, error) {
+		if atomic.AddInt32(&leaderEntered, 1) == 1 {
+			<-release
+			panic("simulated forward panic")
+		}
+		t.Errorf("siblings should not call forward; the leader's panic should propagate")
+		return 0, nil, nil
+	}
+
+	body := []byte(`{"to":"a@b.com"}`)
+	type outcome struct {
+		res Result
+		err error
+	}
+	results := make([]outcome, 3)
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					results[i] = outcome{err: fmt.Errorf("propagated panic: %v", r)}
+				}
+			}()
+			res, err := pl.Apply(context.Background(), "send_email", body, forward)
+			results[i] = outcome{res: res, err: err}
+		}(i)
+	}
+
+	time.Sleep(50 * time.Millisecond) // let siblings queue as waiters
+	close(release)
+	wg.Wait()
+
+	// At least one of the three goroutines should report an error (the leader's
+	// panic or a "leader failed" error to waiters). None should silently
+	// return a zero Result with no signal.
+	failures := 0
+	for i, o := range results {
+		if o.err != nil {
+			failures++
+			continue
+		}
+		if o.res.StatusCode == 0 && len(o.res.Body) == 0 {
+			t.Errorf("result[%d] is a silent zero Result: callers cannot tell forward failed", i)
+		}
+	}
+	if failures == 0 {
+		t.Errorf("expected at least one goroutine to surface the leader's panic, got none")
+	}
 }
 
 func TestApply_CoalescesConcurrentDuplicates(t *testing.T) {

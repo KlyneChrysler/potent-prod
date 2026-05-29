@@ -240,14 +240,29 @@ func (p *Pipeline) Apply(ctx context.Context, tool string, body []byte, forward 
 		// log_only fall through because they always forward by design.
 		if pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache {
 			if res, leader, leaderHandle := p.acquireLeader(hash); !leader {
-				return p.waitForLeader(ctx, res), nil
+				return p.waitForLeader(ctx, res)
 			} else {
-				defer p.releaseLeader(hash, leaderHandle)
-				return p.doForward(ctx, tool, hash, intent, pol, body, forward, leaderHandle)
+				return p.runLeader(ctx, tool, hash, intent, pol, body, forward, leaderHandle)
 			}
 		}
 		return p.doForward(ctx, tool, hash, intent, pol, body, forward, nil)
 	}
+}
+
+// runLeader runs doForward with panic recovery. A panic in the forward
+// closure is captured on the inflight handle so waiters surface it as
+// an error instead of receiving a silent zero Result. The panic is
+// re-raised at the end so the leader's own caller sees it.
+func (p *Pipeline) runLeader(ctx context.Context, tool, hash, intent string, pol policy.ToolPolicy, body []byte, forward Forwarder, leaderHandle *applyInflight) (res Result, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			leaderHandle.err = fmt.Errorf("forward panic: %v", r)
+			p.releaseLeader(hash, leaderHandle)
+			panic(r) // re-raise so the leader's own caller sees the panic too
+		}
+		p.releaseLeader(hash, leaderHandle)
+	}()
+	return p.doForward(ctx, tool, hash, intent, pol, body, forward, leaderHandle)
 }
 
 // acquireLeader registers an in-flight forward for the given hash. Returns
@@ -277,17 +292,22 @@ func (p *Pipeline) releaseLeader(hash string, h *applyInflight) {
 
 // waitForLeader blocks until the leader's forward + cache write completes,
 // then returns the leader's Result with the waiter's view of the decision.
-func (p *Pipeline) waitForLeader(ctx context.Context, leader *applyInflight) Result {
+// If the leader's forward closure failed (returned an error or panicked),
+// that failure is surfaced to the waiter instead of a silent zero Result.
+func (p *Pipeline) waitForLeader(ctx context.Context, leader *applyInflight) (Result, error) {
 	select {
 	case <-leader.done:
+		if leader.err != nil {
+			return Result{Decision: DecisionForward}, fmt.Errorf("leader failed: %w", leader.err)
+		}
 		// Borrow the leader's body/status. Mark as Replay so callers can
 		// distinguish a coalesced response from a fresh forward.
 		r := leader.result
 		r.Decision = DecisionReplay
 		r.Match = Match{Kind: "exact", Similarity: 1.0}
-		return r
+		return r, nil
 	case <-ctx.Done():
-		return Result{Decision: DecisionForward}
+		return Result{Decision: DecisionForward}, ctx.Err()
 	}
 }
 

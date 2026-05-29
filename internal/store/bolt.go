@@ -44,6 +44,81 @@ func OpenBolt(path string, clock func() time.Time) (*Bolt, error) {
 // Close releases the underlying database file.
 func (b *Bolt) Close() error { return b.db.Close() }
 
+// Compact iterates every entry and deletes those whose TTL has lapsed.
+// Lazy delete in Get only reclaims an entry on access; without Compact,
+// entries that are never accessed past their TTL remain on disk forever
+// and the file grows without bound. Returns the number of entries removed.
+func (b *Bolt) Compact(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	now := b.now()
+	var expiredKeys [][]byte
+
+	// Read pass: find expired keys under a read-only transaction so we do
+	// not hold a writer lock while scanning the whole bucket.
+	err := b.db.View(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(bucketName)
+		return bkt.ForEach(func(k, v []byte) error {
+			var e Entry
+			if err := json.Unmarshal(v, &e); err != nil {
+				return nil // skip malformed entries; a later run will clean them
+			}
+			if e.Expired(now) {
+				key := make([]byte, len(k))
+				copy(key, k)
+				expiredKeys = append(expiredKeys, key)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, fmt.Errorf("scan: %w", err)
+	}
+
+	if len(expiredKeys) == 0 {
+		return 0, nil
+	}
+
+	// Write pass: delete the expired keys in one transaction.
+	err = b.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(bucketName)
+		for _, k := range expiredKeys {
+			if err := bkt.Delete(k); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("delete: %w", err)
+	}
+	return len(expiredKeys), nil
+}
+
+// RunCompactor starts a background goroutine that calls Compact at the
+// given interval until ctx is cancelled. Errors and the count of expired
+// entries are logged through the supplied callback so the operator can
+// emit metrics from a separate package without store importing slog.
+func (b *Bolt) RunCompactor(ctx context.Context, interval time.Duration, onResult func(removed int, err error)) {
+	if interval <= 0 {
+		return
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			n, err := b.Compact(ctx)
+			if onResult != nil {
+				onResult(n, err)
+			}
+		}
+	}
+}
+
 // Get returns the cached entry. Expired entries are reported as ErrNotFound
 // and lazily deleted.
 func (b *Bolt) Get(ctx context.Context, tool, hash string) (Entry, error) {
