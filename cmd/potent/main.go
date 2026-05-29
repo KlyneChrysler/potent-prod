@@ -34,6 +34,7 @@ import (
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/proxy"
 	"github.com/potent/potent/internal/store"
+	"github.com/potent/potent/internal/tracing"
 )
 
 // Build metadata, populated by goreleaser via -ldflags.
@@ -88,7 +89,11 @@ func run() error {
 	// Log to stderr. In mcp-stdio mode, stdout is the JSON-RPC protocol
 	// channel and any non-protocol byte on it corrupts the stream. Stderr
 	// is the conventional log sink anyway, so all modes get it.
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// The tracing slog handler injects trace_id and span_id into every
+	// record whose context carries a W3C trace context, so logs correlate
+	// with whatever distributed-tracing backend the operator runs.
+	base := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	logger := slog.New(tracing.NewSlogHandler(base))
 	slog.SetDefault(logger)
 
 	if *upstream == "" {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/store"
+	"github.com/potent/potent/internal/tracing"
 )
 
 // Inspector is the subset of store.Store that the admin API needs. Defining
@@ -72,7 +73,7 @@ func Handler(in Inspector, er Eraser, token string) http.Handler {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	return auth.RequireBearer(token, "potent-admin", mux)
+	return tracing.Middleware(auth.RequireBearer(token, "potent-admin", mux))
 }
 
 // Stats summarizes cache state per tool.

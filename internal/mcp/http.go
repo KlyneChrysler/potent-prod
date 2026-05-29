@@ -14,6 +14,7 @@ import (
 
 	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/pipeline"
+	"github.com/potent/potent/internal/tracing"
 )
 
 // DefaultMaxBodyBytes caps a single JSON-RPC frame body. MCP frames are
@@ -88,14 +89,18 @@ func NewHTTPHandler(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logge
 	return h
 }
 
-// Handler returns the MCP HTTP handler wrapped with bearer-token auth when
-// an API token is configured. Mount this rather than the bare HTTPHandler.
-// Multi-tenant (apiTokens) takes precedence over single-token (apiToken).
+// Handler returns the MCP HTTP handler wrapped with bearer-token auth and
+// W3C trace-context middleware. Mount this rather than the bare
+// HTTPHandler. Multi-tenant (apiTokens) takes precedence over single-
+// token (apiToken).
 func (h *HTTPHandler) Handler() http.Handler {
+	var inner http.Handler = h
 	if len(h.apiTokens) > 0 {
-		return auth.RequireBearerCallers(h.apiTokens, "potent-mcp", h)
+		inner = auth.RequireBearerCallers(h.apiTokens, "potent-mcp", inner)
+	} else {
+		inner = auth.RequireBearer(h.apiToken, "potent-mcp", inner)
 	}
-	return auth.RequireBearer(h.apiToken, "potent-mcp", h)
+	return tracing.Middleware(inner)
 }
 
 // ServeHTTP implements http.Handler.
@@ -144,12 +149,12 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	caller := auth.CallerFromContext(r.Context())
 	res, err := h.pipeline.Apply(r.Context(), tool, caller, args, forward)
 	if err != nil {
-		h.logger.Warn("pipeline apply", "err", err, "tool", tool)
+		h.logger.WarnContext(r.Context(), "pipeline apply", "err", err, "tool", tool)
 		h.writeRPCError(w, msg.ID, -32603, "pipeline error")
 		return
 	}
 
-	h.logger.Info("mcp tools/call",
+	h.logger.InfoContext(r.Context(), "mcp tools/call",
 		"tool", tool,
 		"hash", res.Hash,
 		"decision", res.Decision.String(),
@@ -213,6 +218,9 @@ func (h *HTTPHandler) passthrough(w http.ResponseWriter, r *http.Request, body [
 		return
 	}
 	copyHeaders(req.Header, r.Header)
+	if sc, ok := tracing.FromContext(r.Context()); ok && sc.Valid() {
+		tracing.InjectInto(req, sc)
+	}
 
 	// Upstream URL host/scheme are operator-configured; only path/query are
 	// appended from the inbound request (a proxy's expected behavior).
@@ -240,6 +248,9 @@ func (h *HTTPHandler) forwardOnce(ctx context.Context, r *http.Request, body []b
 	copyHeaders(req.Header, r.Header)
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if sc, ok := tracing.FromContext(ctx); ok && sc.Valid() {
+		tracing.InjectInto(req, sc)
 	}
 	// Upstream URL host/scheme are operator-configured; only path/query are
 	// appended from the inbound request (a proxy's expected behavior).
