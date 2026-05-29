@@ -91,6 +91,13 @@ type Pipeline struct {
 	audit    *audit.Writer
 	now      func() time.Time
 
+	// shadow, when true, forces every Apply/Lookup decision to Forward
+	// regardless of policy while still computing the would-be decision
+	// and writing it to the audit log. Lets operators measure what the
+	// pipeline would have done against real traffic before flipping the
+	// policy on.
+	shadow bool
+
 	// inflightMu guards inflight; only Apply mutates the map.
 	inflightMu sync.Mutex
 	// inflight coalesces concurrent Apply calls with the same fingerprint
@@ -161,6 +168,13 @@ func WithMetrics(m *metrics.Metrics) Option { return func(p *Pipeline) { p.metri
 func WithClock(c func() time.Time) Option   { return func(p *Pipeline) { p.now = c } }
 func WithAudit(a *audit.Writer) Option      { return func(p *Pipeline) { p.audit = a } }
 
+// WithShadow enables shadow mode. In shadow mode every tool call is
+// forwarded to upstream (no replays, no blocks, no rate-limit
+// rejections) but the audit log records what the policy would have
+// done. Used by operators to calibrate semantic_threshold and ACLs
+// against real traffic before flipping the policy on.
+func WithShadow(on bool) Option { return func(p *Pipeline) { p.shadow = on } }
+
 // Lookup evaluates policy + cache without calling upstream. Returns the
 // decision (Replay/Block/Forward/RateLimited/Forbidden), the cached entry
 // if applicable, and the hash/intent the caller needs to later store a
@@ -179,12 +193,18 @@ func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte)
 	if !pol.AllowsCaller(caller) {
 		p.recordDecision(tool, pol.Mode, DecisionForbidden)
 		p.writeAudit(tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
+		if p.shadow {
+			return Result{Decision: DecisionForward}, "", nil
+		}
 		return Result{Decision: DecisionForbidden, StatusCode: 403}, "", nil
 	}
 
 	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
 		p.recordDecision(tool, pol.Mode, DecisionRateLimited)
 		p.writeAudit(tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
+		if p.shadow {
+			return Result{Decision: DecisionForward}, "", nil
+		}
 		return Result{Decision: DecisionRateLimited, StatusCode: 429}, "", nil
 	}
 
@@ -196,6 +216,13 @@ func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte)
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
 	p.recordDecision(tool, pol.Mode, decision)
 	p.writeAudit(tool, string(pol.Mode), decision, match, hash, entry.Hash)
+
+	// In shadow mode the mcp-stdio adapter must always forward to the child
+	// server. The Cache call after the child responds will populate the
+	// store so a future identical call surfaces as a would-replay.
+	if p.shadow {
+		return Result{Decision: DecisionForward, Hash: hash}, intent, nil
+	}
 
 	switch decision {
 	case DecisionReplay:
@@ -269,12 +296,18 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 	if !pol.AllowsCaller(caller) {
 		p.recordDecision(tool, pol.Mode, DecisionForbidden)
 		p.writeAudit(tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
+		if p.shadow {
+			return p.shadowForward(ctx, tool, "", "", pol, body, forward)
+		}
 		return Result{Decision: DecisionForbidden, StatusCode: 403}, nil
 	}
 
 	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
 		p.recordDecision(tool, pol.Mode, DecisionRateLimited)
 		p.writeAudit(tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
+		if p.shadow {
+			return p.shadowForward(ctx, tool, "", "", pol, body, forward)
+		}
 		return Result{Decision: DecisionRateLimited, StatusCode: 429}, nil
 	}
 
@@ -286,6 +319,13 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
 	p.recordDecision(tool, pol.Mode, decision)
 	p.writeAudit(tool, string(pol.Mode), decision, match, hash, entry.Hash)
+
+	// In shadow mode every decision becomes Forward on the wire while the
+	// audit log keeps the policy's view. The cache still gets written so a
+	// subsequent identical call would surface as a would-replay.
+	if p.shadow {
+		return p.shadowForward(ctx, tool, hash, intent, pol, body, forward)
+	}
 
 	switch decision {
 	case DecisionReplay:
@@ -314,6 +354,41 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 		}
 		return p.doForward(ctx, tool, hash, intent, pol, body, forward, nil)
 	}
+}
+
+// shadowForward forces a Forward response while still caching the upstream
+// reply (so a subsequent identical call surfaces as a would-replay in the
+// audit log). When the analyse stage produced no hash (because the call
+// failed an earlier gate like the ACL or rate limit), the cache write is
+// skipped; the audit record already noted what would have blocked.
+func (p *Pipeline) shadowForward(ctx context.Context, tool, hash, intent string, pol policy.ToolPolicy, body []byte, forward Forwarder) (Result, error) {
+	start := p.now()
+	status, resp, err := forward(ctx)
+	p.recordUpstreamLatency(tool, p.now().Sub(start).Seconds())
+	if err != nil {
+		return Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}, err
+	}
+	if hash != "" && (pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache) && status >= 200 && status < 300 {
+		var emb []float32
+		if p.embedder != nil && pol.SemanticThreshold > 0 && intent != "" {
+			if v, eerr := p.embedder.Embed(intent); eerr == nil {
+				emb = v
+			}
+		}
+		if perr := p.store.Put(ctx, store.Entry{
+			Tool:       tool,
+			Hash:       hash,
+			Request:    body,
+			Response:   resp,
+			StatusCode: status,
+			CreatedAt:  p.now(),
+			TTL:        pol.TTL,
+			Embedding:  emb,
+		}); perr != nil {
+			p.recordStoreError("put")
+		}
+	}
+	return Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}, nil
 }
 
 // runLeader runs doForward with panic recovery. A panic in the forward
@@ -507,14 +582,23 @@ func (p *Pipeline) writeAudit(tool, mode string, d Decision, match Match, freshH
 	if h == "" {
 		h = freshHash
 	}
-	p.audit.Write(audit.Record{
+	rec := audit.Record{
 		Tool:       tool,
 		Mode:       mode,
 		Decision:   d.String(),
 		Match:      match.Kind,
 		Similarity: match.Similarity,
 		Hash:       h,
-	})
+	}
+	if p.shadow {
+		// In shadow mode every call is forwarded regardless of policy. The
+		// pipeline's choice (d) becomes WouldDecision; Decision reflects
+		// what actually happened on the wire.
+		rec.Shadow = true
+		rec.WouldDecision = d.String()
+		rec.Decision = DecisionForward.String()
+	}
+	p.audit.Write(rec)
 }
 
 func (p *Pipeline) recordUpstreamLatency(tool string, seconds float64) {

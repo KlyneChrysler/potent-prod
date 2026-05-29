@@ -35,7 +35,12 @@ func run() error {
 	embedN := flag.Int("embed-ngram", 4, "char n-gram size")
 	jsonOut := flag.Bool("json", false, "emit a single json document instead of human tables")
 	verbose := flag.Bool("v", false, "include the full threshold sweep (slow for large datasets)")
+	fromAudit := flag.String("from-audit", "", "summarize a potent audit-log jsonl file instead of running the threshold sweep (use with -shadow-mode captures)")
 	flag.Parse()
+
+	if *fromAudit != "" {
+		return summarizeAudit(*fromAudit, *jsonOut)
+	}
 
 	records, err := eval.LoadDataset(*datasetPath)
 	if err != nil {
@@ -157,6 +162,57 @@ func emitHuman(records []eval.Record, pairs []eval.Pair, metrics []eval.Metrics,
 		tw.Flush()
 	}
 	return nil
+}
+
+// summarizeAudit reads a shadow-mode audit log and renders the per-tool
+// would-decision distribution and the top repeated fingerprint. Operators
+// run potent with -shadow-mode -audit-log /path/to/audit.log for a
+// representative window, then feed the file here.
+func summarizeAudit(path string, asJSON bool) error {
+	records, err := eval.LoadAuditLog(path)
+	if err != nil {
+		return fmt.Errorf("load audit log: %w", err)
+	}
+	if len(records) == 0 {
+		return fmt.Errorf("audit log %q is empty", path)
+	}
+	summary := eval.Summarize(records)
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(summary)
+	}
+	fmt.Printf("audit log: %d records, %d tools\n\n", summary.Records, len(summary.Tools))
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "tool\trecords\twould_replay_rate\tunique_hashes\ttop_hash_count\tdecisions")
+	for _, tool := range summary.SortedTools() {
+		tr := summary.Tools[tool]
+		decKeys := make([]string, 0, len(tr.WouldDecisions))
+		for k := range tr.WouldDecisions {
+			decKeys = append(decKeys, k)
+		}
+		sort.Strings(decKeys)
+		parts := make([]string, 0, len(decKeys))
+		for _, k := range decKeys {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, tr.WouldDecisions[k]))
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%.3f\t%d\t%d\t%s\n",
+			tool, tr.Records, tr.WouldReplayRate, tr.UniqueHashes, tr.TopRepeatedCount,
+			joinKV(parts))
+	}
+	tw.Flush()
+	return nil
+}
+
+func joinKV(parts []string) string {
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out += ", "
+		}
+		out += p
+	}
+	return out
 }
 
 func sortedToolNames(m map[string]eval.Metrics) []string {

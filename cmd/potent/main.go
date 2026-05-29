@@ -74,6 +74,7 @@ func run() error {
 	upstreamCert := flag.String("upstream-cert", "", "PEM file with client certificate for mTLS to upstream")
 	upstreamKey := flag.String("upstream-key", "", "PEM file with client private key for mTLS to upstream")
 	upstreamSkipVerify := flag.Bool("upstream-insecure-skip-verify", false, "skip upstream TLS verification (testing only; never enable in production)")
+	shadowMode := flag.Bool("shadow-mode", false, "observe-only: every call is forwarded and audit log records the would-be decision; useful for calibrating semantic_threshold and ACLs against real traffic before flipping the policy on")
 	flag.Parse()
 
 	apiToken := os.Getenv("POTENT_API_TOKEN")
@@ -147,11 +148,16 @@ func run() error {
 	}
 
 	m := metrics.New(nil)
-	pl := pipeline.New(cfg, st,
+	plOpts := []pipeline.Option{
 		pipeline.WithMetrics(m),
 		pipeline.WithEmbedder(emb),
 		pipeline.WithAudit(auditWriter),
-	)
+	}
+	if *shadowMode {
+		logger.Warn("shadow mode is on: every tool call will be forwarded; audit log records would-be decisions")
+		plOpts = append(plOpts, pipeline.WithShadow(true))
+	}
+	pl := pipeline.New(cfg, st, plOpts...)
 
 	if *adminAddr != "" {
 		if adminToken == "" {

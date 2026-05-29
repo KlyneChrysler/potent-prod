@@ -30,6 +30,13 @@ type Record struct {
 	Similarity float32   `json:"similarity,omitempty"`
 	Hash       string    `json:"hash"`
 	Protocol   string    `json:"protocol,omitempty"`
+
+	// Shadow is true when the proxy was running in shadow mode at the time
+	// of this decision. Decision is the action that was actually taken
+	// (always "forward" in shadow); WouldDecision is what the policy would
+	// have chosen if shadow had been off.
+	Shadow        bool   `json:"shadow,omitempty"`
+	WouldDecision string `json:"would_decision,omitempty"`
 }
 
 // Writer accepts records on a buffered channel. Construct via Open or
