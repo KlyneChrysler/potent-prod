@@ -19,6 +19,11 @@ import (
 // cache hit short-circuits the child entirely; a miss forwards as usual
 // and the child's response is captured + cached on the way back.
 //
+// Pipelined duplicate requests (real MCP clients dispatch multiple
+// tools/call frames without waiting for responses) are coalesced: the
+// first request becomes the "leader" and is forwarded; subsequent
+// duplicates wait on the leader's response and receive replays.
+//
 // Server→client messages (notifications, results to earlier requests,
 // server-initiated requests like sampling/createMessage) flow through
 // untouched.
@@ -28,16 +33,28 @@ type StdioHandler struct {
 	cmdArgs  []string
 	logger   *slog.Logger
 
-	// pending tracks the tool name and original client id for in-flight
-	// tools/call requests so the response from the child can be matched
-	// back and cached against the right tool.
-	mu      sync.Mutex
-	pending map[string]pendingCall
+	mu       sync.Mutex
+	pending  map[string]pendingCall   // request id -> leader call
+	inflight map[string]*inflightCall // fingerprint hash -> in-flight forward
+
+	// writeMu serializes writes to clientOut. The dedup pipeline writes from
+	// both pumps (replays from the client pump, leader and fan-out from the
+	// child pump); without serialization their byte streams can interleave
+	// on the same writer.
+	writeMu sync.Mutex
 }
 
 type pendingCall struct {
 	tool string
 	args []byte
+	hash string
+}
+
+// inflightCall coalesces concurrent duplicate tools/call requests. The leader
+// is the request that was actually forwarded to the child; waiters are
+// subsequent duplicates that arrived before the leader's response was cached.
+type inflightCall struct {
+	waiters []json.RawMessage // client request ids awaiting the leader's response
 }
 
 // NewStdioHandler constructs a stdio MCP adapter that will exec the given
@@ -52,6 +69,7 @@ func NewStdioHandler(pl *pipeline.Pipeline, cmdPath string, cmdArgs []string, lo
 		cmdArgs:  cmdArgs,
 		logger:   logger,
 		pending:  make(map[string]pendingCall),
+		inflight: make(map[string]*inflightCall),
 	}
 }
 
@@ -127,15 +145,25 @@ func (h *StdioHandler) pumpClientToChild(ctx context.Context, in io.Reader, chil
 		switch res.Decision {
 		case pipeline.DecisionReplay:
 			h.logger.Info("stdio replay", "tool", tool, "match", res.Match.Kind, "similarity", res.Match.Similarity)
-			h.writeLine(clientOut, reframeWithID(res.Body, msg.ID))
+			h.writeClient(clientOut, reframeWithID(res.Body, msg.ID))
 		case pipeline.DecisionBlock:
 			h.logger.Info("stdio block", "tool", tool)
 			blocked := NewErrorResponse(msg.ID, -32000, "duplicate request blocked by policy")
 			out, _ := json.Marshal(blocked)
-			h.writeLine(clientOut, out)
+			h.writeClient(clientOut, out)
 		default:
 			h.mu.Lock()
-			h.pending[string(msg.ID)] = pendingCall{tool: tool, args: args}
+			if ifc, ok := h.inflight[res.Hash]; ok {
+				// a sibling forward is already in flight; queue as a waiter
+				// so we get a replay when the leader's response lands.
+				idCopy := append(json.RawMessage(nil), msg.ID...)
+				ifc.waiters = append(ifc.waiters, idCopy)
+				h.mu.Unlock()
+				h.logger.Info("stdio coalesce", "tool", tool, "hash", res.Hash)
+				continue
+			}
+			h.pending[string(msg.ID)] = pendingCall{tool: tool, args: args, hash: res.Hash}
+			h.inflight[res.Hash] = &inflightCall{}
 			h.mu.Unlock()
 			h.writeLine(childIn, copyLine)
 		}
@@ -151,32 +179,72 @@ func (h *StdioHandler) pumpChildToClient(childOut io.Reader, clientOut io.Writer
 
 		var msg Message
 		if err := json.Unmarshal(copyLine, &msg); err == nil && msg.IsResponse() {
-			h.maybeCacheResponse(&msg, copyLine)
+			waiters := h.maybeCacheResponse(&msg, copyLine)
+			h.writeClient(clientOut, copyLine)
+			// fan out the cached body to coalesced duplicate requests
+			for _, waiterID := range waiters {
+				h.writeClient(clientOut, reframeWithID(copyLine, waiterID))
+			}
+			continue
 		}
-		h.writeLine(clientOut, copyLine)
+		h.writeClient(clientOut, copyLine)
 	}
 }
 
-func (h *StdioHandler) maybeCacheResponse(msg *Message, raw []byte) {
+// maybeCacheResponse stores the response and returns the list of pipelined
+// duplicate request ids that were waiting on this leader's result. Each
+// waiter id should receive the same response body (with its own id substituted).
+func (h *StdioHandler) maybeCacheResponse(msg *Message, raw []byte) []json.RawMessage {
 	h.mu.Lock()
 	call, ok := h.pending[string(msg.ID)]
-	if ok {
-		delete(h.pending, string(msg.ID))
-	}
-	h.mu.Unlock()
 	if !ok {
-		return
+		h.mu.Unlock()
+		return nil
 	}
+	delete(h.pending, string(msg.ID))
+	h.mu.Unlock()
+
+	// cache outside the lock; Cache may touch disk / network for embeddings
 	if err := h.pipeline.Cache(context.Background(), call.tool, call.args, 200, raw); err != nil {
 		h.logger.Warn("cache response", "tool", call.tool, "err", err)
 	}
+
+	// now collect waiters and clear the in-flight entry. Any tools/call that
+	// arrived between the Cache write and this delete will still see inflight
+	// and be appended to waiters; that's correct behavior.
+	h.mu.Lock()
+	ifc := h.inflight[call.hash]
+	delete(h.inflight, call.hash)
+	h.mu.Unlock()
+	if ifc == nil {
+		return nil
+	}
+	if len(ifc.waiters) > 0 {
+		h.logger.Info("stdio fan-out", "tool", call.tool, "waiters", len(ifc.waiters))
+	}
+	return ifc.waiters
 }
 
+// writeLine writes a single JSON-RPC frame plus terminating newline as one
+// atomic Write so concurrent callers don't interleave bytes on the writer.
+// When the writer is the shared clientOut, writeMu must be held to keep
+// successive frames from being mixed by the receiver.
 func (h *StdioHandler) writeLine(w io.Writer, line []byte) {
-	if _, err := w.Write(line); err != nil {
-		return
+	var buf []byte
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		buf = line
+	} else {
+		buf = make([]byte, 0, len(line)+1)
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
 	}
-	if len(line) == 0 || line[len(line)-1] != '\n' {
-		_, _ = w.Write([]byte{'\n'})
-	}
+	_, _ = w.Write(buf)
+}
+
+// writeClient is the only entry point that should write to the shared
+// clientOut. It serializes concurrent writers so frames don't interleave.
+func (h *StdioHandler) writeClient(clientOut io.Writer, line []byte) {
+	h.writeMu.Lock()
+	h.writeLine(clientOut, line)
+	h.writeMu.Unlock()
 }
