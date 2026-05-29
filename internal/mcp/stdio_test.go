@@ -195,6 +195,92 @@ func TestStdio_NonToolsCallPassesThrough(t *testing.T) {
 	_ = childOutW.Close()
 }
 
+func TestStdio_CoalescesPipelinedDuplicates(t *testing.T) {
+	// Real MCP clients dispatch multiple tools/call frames without waiting
+	// for responses. Three identical calls sent before any response should
+	// result in exactly one upstream call; the other two should be replayed
+	// from the cached leader response with their own correlation ids.
+
+	fake := &fakeMCPServer{}
+
+	clientIn, clientInW := io.Pipe()
+	clientOutR, clientOut := io.Pipe()
+	childInR, childInW := io.Pipe()
+	childOutR, childOutW := io.Pipe()
+
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewStdioHandler(pl, "/nonexistent", nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); defer childInW.Close(); h.pumpClientToChild(ctx, clientIn, childInW, clientOut) }()
+	go func() { defer wg.Done(); defer clientOut.Close(); h.pumpChildToClient(childOutR, clientOut) }()
+	go func() { defer wg.Done(); defer childOutW.Close(); fake.handle(childInR, childOutW) }()
+
+	// blast 3 identical tools/call frames concurrently with the response
+	// reader; io.Pipe has zero buffer so writing and reading must overlap.
+	go func() {
+		for _, id := range []int{1, 2, 3} {
+			frame := map[string]any{
+				"jsonrpc": "2.0", "id": id, "method": "tools/call",
+				"params": map[string]any{"name": "send_email", "arguments": map[string]any{"to": "a@b.com"}},
+			}
+			b, _ := json.Marshal(frame)
+			b = append(b, '\n')
+			_, _ = clientInW.Write(b)
+		}
+	}()
+
+	// drain 3 responses
+	got := make([]Message, 0, 3)
+	for i := 0; i < 3; i++ {
+		line := readLine(t, clientOutR)
+		var m Message
+		if err := json.Unmarshal(line, &m); err != nil {
+			t.Fatalf("decode #%d: %v\nraw: %s", i, err, line)
+		}
+		got = append(got, m)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	_ = clientInW.Close()
+	_ = childOutW.Close()
+
+	if fake.callCount() != 1 {
+		t.Errorf("upstream call count = %d, want 1 (the other two should be coalesced)", fake.callCount())
+	}
+
+	// all three responses must carry the same result body
+	for i := 1; i < len(got); i++ {
+		if !bytes.Equal(got[i].Result, got[0].Result) {
+			t.Errorf("response %d result differs from response 0:\nr0=%s\nr%d=%s", i, got[0].Result, i, got[i].Result)
+		}
+	}
+
+	// each response id must be unique and match one of the request ids
+	seen := map[int]bool{}
+	for _, m := range got {
+		var id int
+		_ = json.Unmarshal(m.ID, &id)
+		if id < 1 || id > 3 {
+			t.Errorf("unexpected response id %d", id)
+		}
+		if seen[id] {
+			t.Errorf("duplicate response id %d", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("expected responses for all 3 request ids, got %v", seen)
+	}
+}
+
 func TestStdio_RunFailsOnBadCommand(t *testing.T) {
 	cfg := &policy.Config{}
 	pl := pipeline.New(cfg, store.NewMemory(nil))
