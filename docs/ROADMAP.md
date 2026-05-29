@@ -1,39 +1,27 @@
 # Roadmap
 
-## Week 1 — Spike + measurement
-- [x] Repo scaffold
-- [ ] HTTP reverse proxy skeleton
-- [ ] bge-small ONNX integration spike
-- [ ] Benchmark: <5ms p99 on cache hit, <20ms on embed miss
-- [ ] Decision gate: hash-only fallback if embed too slow
+Current version: v0.1.6. See [architecture.md](./architecture.md) for an overview of what shipped and how the pipeline fits together.
 
-## Week 2 — Core engine
-- [ ] Canonical JSON normalizer
-- [ ] BLAKE3 exact-match path
-- [ ] BoltDB store
-- [ ] Policy YAML loader + validation
-- [ ] Unit tests (Unicode, nested, arrays)
+## Shipped (v0.1.0 to v0.1.6)
 
-## Week 3 — Semantic tier
-- [ ] Embedding cache layer
-- [ ] Cosine similarity search (brute force <10k)
-- [ ] Replay decision pipeline
-- [ ] Response headers: X-Potent-Status, X-Potent-Similarity
+- Three proxy modes: `http` (generic reverse proxy keyed on `X-Potent-Tool`), `mcp-http` (Streamable HTTP MCP), `mcp-stdio` (child-process MCP server).
+- Canonical JSON normalizer and BLAKE3 fingerprint for the exact-match path.
+- Char n-gram embedder plus cosine similarity for the semantic-match path.
+- BoltDB persistent store with a background compactor that sweeps expired entries.
+- JSONL audit log with a buffered writer and shutdown drain.
+- Prometheus metrics (`potent_proxy_decisions_total`, `potent_proxy_upstream_latency_seconds`, `potent_store_errors_total`).
+- Response headers: `X-Potent-Status`, `X-Potent-Hash`, `X-Potent-Match`, `X-Potent-Similarity`.
+- Authenticated admin API behind `POTENT_ADMIN_TOKEN`, constant-time comparison, loopback warning.
+- Pipeline coalescing for `http` and `mcp-http`, plus in-flight `mcp-stdio` coalescing so concurrent retries share one upstream call.
+- Panic recovery middleware on every proxy handler.
+- Leader timeout sweeper that releases stuck coalesced waiters with a synthetic error.
+- Inbound body size cap (`-max-body-bytes`) for DoS protection.
+- Structured `log/slog` output on stderr with correlation IDs (stdout reserved for mcp-stdio framing).
 
-## Week 4 — MCP integration
-- [ ] Streamable HTTP MCP proxy
-- [ ] stdio MCP proxy
-- [ ] MCP test suite conformance
-- [ ] Auto-suggest policy from tools/list schemas
+## Next
 
-## Week 5 — Ops + audit
-- [ ] Prometheus metrics
-- [ ] JSONL audit log (file + S3)
-- [ ] Admin HTTP API
-- [ ] Docker image + k8s manifest
-
-## Week 6 — Polish + launch
-- [ ] mkdocs site
-- [ ] 3 example deployments
-- [ ] Demo video
-- [ ] HN / Lobsters / r/LocalLLaMA launch
+- Swap the char n-gram embedder for an ONNX model behind the existing `Embedder` interface.
+- OpenTelemetry traces alongside the Prometheus counters.
+- S3 audit sink in addition to the local JSONL file.
+- Helm chart for k8s, published alongside the existing `deploy/k8s` manifest.
+- mkdocs site built from `docs/` on tag.

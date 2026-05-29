@@ -5,17 +5,20 @@ Drop potent in front of any HTTP tool server. Your OpenAI tool-calling agent poi
 ## Layout
 
 ```
-agent.py        # OpenAI tool-calling loop that executes tools via HTTP
-tool_server.py  # The actual tool (a tiny Flask app that "sends emails")
-policy.yaml     # potent's idempotency policy
+agent.py         # OpenAI tool-calling loop that executes tools via HTTP
+tool_server.py   # The actual tool (a tiny stdlib HTTP server that "sends emails")
+policy.yaml      # potent's idempotency policy
+requirements.txt # pinned Python deps
 ```
 
 ## Run
 
 ```bash
+pip install -r requirements.txt
+
 # Terminal 1: the tool
 python tool_server.py
-# → :8000
+# listens on :8000
 
 # Terminal 2: potent in front of the tool
 potent -mode http -addr :8080 -upstream http://localhost:8000 -policy policy.yaml
@@ -27,11 +30,25 @@ python agent.py "Send Q3 report to alice@example.com"
 
 # Run it again with slightly different wording
 python agent.py "send q3 report to ALICE@example.com"
-# → second run replays, tool_server.py only receives ONE request
+# second run replays. tool_server.py only receives ONE request.
 ```
 
-## What you should see
+## Expected output
 
-`tool_server.py` prints exactly one "sending email" line per unique intent, even when the LLM phrases the request differently each turn.
+After the first run you should see one line on `tool_server.py` stderr:
+
+```
+[tool_server] call #1: send_email to='alice@example.com'
+```
+
+After the second run, no new `tool_server` line appears. `agent.py` stderr instead shows:
+
+```
+[potent] status=replayed match=semantic sim=0.97
+```
 
 `X-Potent-Status: replayed` and `X-Potent-Match: semantic` (or `exact`) appear on the deduped responses.
+
+## Cleanup
+
+Stop each terminal with `Ctrl+C`. If you ran potent with `-store bolt`, remove `potent.db`.

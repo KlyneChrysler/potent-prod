@@ -1,5 +1,7 @@
 # Operating potent
 
+For an overview of the pipeline and package layout, see [architecture.md](./architecture.md).
+
 ## Modes
 
 ```
@@ -23,6 +25,13 @@
 | `-embed-dim`     | `384`                  | Embedding dimension                     |
 | `-embed-ngram`   | `4`                    | Char n-gram size for the embedder       |
 | `-audit-log`     | (disabled)             | JSONL audit records appended here       |
+| `-max-body-bytes` | `1048576` (1 MiB)     | Cap on inbound tool-call request bodies. `0` disables. |
+| `-stdio-request-timeout` | `60s`          | How long an in-flight mcp-stdio `tools/call` may wait before being treated as failed. |
+| `-bolt-compact-interval` | `1h`           | How often the bolt store sweeps expired entries from disk. `0` disables. |
+
+## Coalescing
+
+When two requests with the same fingerprint arrive while the first is still in flight, potent coalesces them. The leader executes upstream once; followers receive the leader response. This works for the generic pipeline (`http`, `mcp-http`) and for `mcp-stdio`. Followers waiting longer than `-stdio-request-timeout` are released with an error rather than blocking indefinitely.
 
 ## Policy file
 
@@ -84,6 +93,13 @@ Each decision appends one JSON line:
 Sends are buffered through a 1024-deep channel; the writer goroutine drains
 the buffer on shutdown. Disk full or slow downstream applies backpressure to
 the request path.
+
+## Resilience
+
+- Panic recovery. Every proxy handler is wrapped in recovery middleware. A panic returns 500 and increments an error metric instead of killing the process.
+- Leader timeout sweeper. Coalesced waiters whose leader exceeds `-stdio-request-timeout` are released with a synthetic error so callers do not hang.
+- Bolt background compactor. Runs every `-bolt-compact-interval`, deletes expired entries in batches, keeps the on-disk file from growing unbounded.
+- Structured logging. All `log/slog` output goes to stderr with correlation IDs. stdout is reserved for `mcp-stdio` JSON-RPC framing.
 
 ## Metrics
 

@@ -202,4 +202,6 @@ If you hit something that doesn't work, open an issue. That's the entire deal of
 
 ## License
 
-Apache 2.0. Use it, fork it, ship it.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE) for details. Use it, fork it, ship it.
