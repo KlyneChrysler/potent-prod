@@ -94,6 +94,20 @@ Sends are buffered through a 1024-deep channel; the writer goroutine drains
 the buffer on shutdown. Disk full or slow downstream applies backpressure to
 the request path.
 
+## Shadow mode
+
+Start potent with `-shadow-mode` and every tool call is forwarded to upstream regardless of policy: no replays, no blocks, no rate-limit rejections, no ACL forbiddens. The audit log records what the policy *would* have done.
+
+Use shadow mode to calibrate `semantic_threshold`, ACLs, and rate limits against real traffic before flipping the policy on. Run for a representative window (a day, a week), then summarize:
+
+```
+potent-eval -from-audit /var/log/potent/audit.log
+```
+
+The summary reports the would-be decision distribution per tool, the unique fingerprint count, and the top repeated hash. The `would_replay_rate` is the headline: it's the fraction of requests that would have been deduped. If it's near zero on a tool, dedup is not earning its keep there. If it's high, you have evidence that flipping the policy on will save real upstream calls.
+
+Shadow mode still writes to the cache, so the would-be replay decisions reflect what production would have done with a warm cache.
+
 ## Resilience
 
 - Panic recovery. Every proxy handler is wrapped in recovery middleware. A panic returns 500 and increments an error metric instead of killing the process.
