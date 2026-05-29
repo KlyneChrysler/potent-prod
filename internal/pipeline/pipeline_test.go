@@ -361,6 +361,159 @@ func TestDecision_ForbiddenString(t *testing.T) {
 	}
 }
 
+func TestApply_ShadowMode_AlwaysForwardsButRecordsWouldDecision(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+		},
+	}}
+	st := store.NewMemory(nil)
+	pl := New(cfg, st, WithShadow(true))
+
+	forwardCalls := 0
+	forward := func(ctx context.Context) (int, []byte, error) {
+		forwardCalls++
+		return 200, []byte(`{"ok":true}`), nil
+	}
+
+	body := []byte(`{"to":"a@b.com"}`)
+
+	// First call. Cache empty. Would-decision is forward (normal). Shadow
+	// still forwards and caches.
+	r1, err := pl.Apply(context.Background(), "send_email", "", body, forward)
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if r1.Decision != DecisionForward {
+		t.Errorf("shadow first call: decision = %v, want Forward", r1.Decision)
+	}
+
+	// Second identical call. In production this would Replay; in shadow it
+	// must still Forward to the upstream.
+	r2, err := pl.Apply(context.Background(), "send_email", "", body, forward)
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if r2.Decision != DecisionForward {
+		t.Errorf("shadow second call: decision = %v, want Forward (shadow disables replays)", r2.Decision)
+	}
+	if forwardCalls != 2 {
+		t.Errorf("expected 2 upstream forwards in shadow mode, got %d", forwardCalls)
+	}
+}
+
+func TestApply_ShadowMode_DoesNotBlockOnForbidden(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			AllowedCallers:    []string{"team-eng"},
+		},
+	}}
+	pl := New(cfg, store.NewMemory(nil), WithShadow(true))
+	calls := 0
+	forward := func(ctx context.Context) (int, []byte, error) {
+		calls++
+		return 200, []byte("{}"), nil
+	}
+	r, err := pl.Apply(context.Background(), "send_email", "team-marketing", []byte(`{"to":"a"}`), forward)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if r.Decision != DecisionForward {
+		t.Errorf("shadow + forbidden caller: decision = %v, want Forward", r.Decision)
+	}
+	if calls != 1 {
+		t.Errorf("forbidden caller in shadow should still reach upstream, got %d calls", calls)
+	}
+}
+
+func TestApply_ShadowMode_DoesNotBlockOnRateLimit(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			RateLimit:         policy.RateLimit{RPS: 1, Burst: 1},
+		},
+	}}
+	pl := New(cfg, store.NewMemory(nil), WithShadow(true))
+	calls := 0
+	forward := func(ctx context.Context) (int, []byte, error) {
+		calls++
+		return 200, []byte("{}"), nil
+	}
+	for i := 0; i < 5; i++ {
+		body := []byte(fmt.Sprintf(`{"to":"u%d@b.com"}`, i))
+		r, err := pl.Apply(context.Background(), "send_email", "", body, forward)
+		if err != nil {
+			t.Fatalf("apply %d: %v", i, err)
+		}
+		if r.Decision != DecisionForward {
+			t.Errorf("call %d: decision = %v, want Forward (shadow ignores rate limit)", i, r.Decision)
+		}
+	}
+	if calls != 5 {
+		t.Errorf("shadow + rate-limited tool should still forward; got %d/5 calls", calls)
+	}
+}
+
+func TestLookup_ShadowMode_AlwaysReturnsForward(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	st := store.NewMemory(nil)
+	pl := New(cfg, st, WithShadow(true))
+
+	// seed the cache so a non-shadow Lookup would Replay
+	_ = pl.store.Put(context.Background(), store.Entry{
+		Tool: "send_email", Hash: hashFor(t, `{"to":"a@b.com"}`),
+		Response: []byte(`{"cached":true}`), StatusCode: 200,
+		CreatedAt: time.Now(), TTL: time.Hour,
+	})
+
+	res, _, err := pl.Lookup(context.Background(), "send_email", "", []byte(`{"to":"a@b.com"}`))
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if res.Decision != DecisionForward {
+		t.Errorf("shadow lookup: decision = %v, want Forward (shadow disables replays)", res.Decision)
+	}
+}
+
+func TestLookup_ShadowMode_DoesNotBlockOnForbiddenOrRateLimit(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"a": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}, AllowedCallers: []string{"x"}},
+		"b": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}, RateLimit: policy.RateLimit{RPS: 1, Burst: 1}},
+	}}
+	pl := New(cfg, store.NewMemory(nil), WithShadow(true))
+
+	res, _, _ := pl.Lookup(context.Background(), "a", "wrong-caller", []byte(`{"to":"x"}`))
+	if res.Decision != DecisionForward {
+		t.Errorf("shadow + forbidden lookup: decision = %v, want Forward", res.Decision)
+	}
+
+	for i := 0; i < 3; i++ {
+		res, _, _ := pl.Lookup(context.Background(), "b", "", []byte(fmt.Sprintf(`{"to":"u%d"}`, i)))
+		if res.Decision != DecisionForward {
+			t.Errorf("shadow + rate-limited lookup #%d: decision = %v, want Forward", i, res.Decision)
+		}
+	}
+}
+
+func hashFor(t *testing.T, body string) string {
+	t.Helper()
+	pol := policy.ToolPolicy{FingerprintFields: []string{"to"}}
+	h, _, err := analyse([]byte(body), pol)
+	if err != nil {
+		t.Fatalf("analyse: %v", err)
+	}
+	return h
+}
+
 func TestApply_RateLimitReturns429WhenExceeded(t *testing.T) {
 	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
 		"send_email": {
