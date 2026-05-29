@@ -69,6 +69,8 @@ func run() error {
 	compactInterval := flag.Duration("bolt-compact-interval", time.Hour, "how often the bolt store sweeps expired entries from disk (0 = disabled)")
 	flag.Parse()
 
+	apiToken := os.Getenv("POTENT_API_TOKEN")
+
 	adminToken := os.Getenv("POTENT_ADMIN_TOKEN")
 
 	// Log to stderr. In mcp-stdio mode, stdout is the JSON-RPC protocol
@@ -151,11 +153,18 @@ func run() error {
 		go runAdmin(*adminAddr, st, adminToken, logger)
 	}
 
+	// Refuse to start an unauthenticated proxy listener on a non-loopback
+	// address. mcp-stdio is single-tenant (the client and child share the
+	// parent process) so the check does not apply.
+	if (*mode == "http" || *mode == "mcp-http") && apiToken == "" && !isLoopbackBind(*addr) {
+		return fmt.Errorf("refusing to expose unauthenticated proxy on %q; set POTENT_API_TOKEN or bind -addr to loopback", *addr)
+	}
+
 	switch *mode {
 	case "http":
-		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes)
+		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken)
 	case "mcp-http":
-		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes)
+		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken)
 	case "mcp-stdio":
 		return runMCPStdio(*upstream, pl, logger, *stdioTimeout)
 	default:
@@ -163,22 +172,22 @@ func run() error {
 	}
 }
 
-func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64) error {
+func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	p := proxy.New(pl, u, logger, proxy.WithMaxBodyBytes(maxBody))
-	return serveDual(addr, metricsAddr, p, m, "http", upstream, logger)
+	p := proxy.New(pl, u, logger, proxy.WithMaxBodyBytes(maxBody), proxy.WithAPIToken(apiToken))
+	return serveDual(addr, metricsAddr, p.Handler(), m, "http", upstream, logger)
 }
 
-func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64) error {
+func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	h := mcp.NewHTTPHandler(pl, u, logger, mcp.WithHTTPMaxBodyBytes(maxBody))
-	return serveDual(addr, metricsAddr, h, m, "mcp-http", upstream, logger)
+	h := mcp.NewHTTPHandler(pl, u, logger, mcp.WithHTTPMaxBodyBytes(maxBody), mcp.WithHTTPAPIToken(apiToken))
+	return serveDual(addr, metricsAddr, h.Handler(), m, "mcp-http", upstream, logger)
 }
 
 func runMCPStdio(cmd string, pl *pipeline.Pipeline, logger *slog.Logger, timeout time.Duration) error {
@@ -196,9 +205,16 @@ func runMCPStdio(cmd string, pl *pipeline.Pipeline, logger *slog.Logger, timeout
 
 func serveDual(addr, metricsAddr string, app http.Handler, m *metrics.Metrics, mode, upstream string, logger *slog.Logger) error {
 	mux := http.NewServeMux()
+	// healthz is liveness: the process is up. readyz is readiness: the
+	// process is willing to accept traffic. Splitting them lets k8s
+	// distinguish "restart me" from "stop sending traffic".
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
 	})
 	mux.Handle("/", app)
 

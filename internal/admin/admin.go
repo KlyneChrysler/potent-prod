@@ -8,12 +8,12 @@ package admin
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/store"
 )
 
@@ -72,26 +72,7 @@ func Handler(in Inspector, er Eraser, token string) http.Handler {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	return requireBearer(token, mux)
-}
-
-// requireBearer wraps next with constant-time bearer token validation. An
-// empty token disables auth — only acceptable in tests; production wiring
-// in cmd/potent rejects an empty token at startup.
-func requireBearer(token string, next http.Handler) http.Handler {
-	if token == "" {
-		return next
-	}
-	expected := []byte("Bearer " + token)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, expected) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="potent-admin"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return auth.RequireBearer(token, "potent-admin", mux)
 }
 
 // Stats summarizes cache state per tool.

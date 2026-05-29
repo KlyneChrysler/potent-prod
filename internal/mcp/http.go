@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 
+	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/pipeline"
 )
 
@@ -29,6 +30,7 @@ type HTTPHandler struct {
 	client       *http.Client
 	logger       *slog.Logger
 	maxBodyBytes int64
+	apiToken     string
 }
 
 // HTTPOption configures an HTTPHandler at construction time.
@@ -38,6 +40,12 @@ type HTTPOption func(*HTTPHandler)
 // disable the cap (not recommended).
 func WithHTTPMaxBodyBytes(n int64) HTTPOption {
 	return func(h *HTTPHandler) { h.maxBodyBytes = n }
+}
+
+// WithHTTPAPIToken gates every inbound request behind constant-time bearer
+// token validation. An empty token disables auth.
+func WithHTTPAPIToken(token string) HTTPOption {
+	return func(h *HTTPHandler) { h.apiToken = token }
 }
 
 // NewHTTPHandler constructs the MCP HTTP adapter.
@@ -56,6 +64,12 @@ func NewHTTPHandler(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logge
 		opt(h)
 	}
 	return h
+}
+
+// Handler returns the MCP HTTP handler wrapped with bearer-token auth when
+// an API token is configured. Mount this rather than the bare HTTPHandler.
+func (h *HTTPHandler) Handler() http.Handler {
+	return auth.RequireBearer(h.apiToken, "potent-mcp", h)
 }
 
 // ServeHTTP implements http.Handler.
@@ -118,6 +132,12 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Potent-Hash", res.Hash)
 	w.Header().Set("Content-Type", "application/json")
 	switch res.Decision {
+	case pipeline.DecisionRateLimited:
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusOK)
+		blocked := NewErrorResponse(msg.ID, -32005, "rate limit exceeded")
+		_ = json.NewEncoder(w).Encode(blocked)
+		return
 	case pipeline.DecisionReplay:
 		// Reshape the cached upstream response into a JSON-RPC frame so the
 		// client cannot tell the cache hit from a fresh response besides the

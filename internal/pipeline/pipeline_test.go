@@ -285,6 +285,67 @@ func TestBuildIntent_HandlesScalarTypes(t *testing.T) {
 	})
 }
 
+func TestApply_RateLimitReturns429WhenExceeded(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			RateLimit:         policy.RateLimit{RPS: 2, Burst: 1},
+		},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+	forward := func(ctx context.Context) (int, []byte, error) {
+		return 200, []byte(`{"ok":true}`), nil
+	}
+
+	// burst is 1, so the second back-to-back call exceeds the limit
+	body1 := []byte(`{"to":"a@b.com"}`)
+	body2 := []byte(`{"to":"b@b.com"}`) // different intent so the cache does not absorb it
+	r1, err := pl.Apply(context.Background(), "send_email", body1, forward)
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if r1.Decision != DecisionForward {
+		t.Errorf("first call should pass through, got %v", r1.Decision)
+	}
+	r2, err := pl.Apply(context.Background(), "send_email", body2, forward)
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if r2.Decision != DecisionRateLimited {
+		t.Errorf("second call should be rate-limited, got %v (status %d)", r2.Decision, r2.StatusCode)
+	}
+	if r2.StatusCode != 429 {
+		t.Errorf("rate-limited status = %d, want 429", r2.StatusCode)
+	}
+}
+
+func TestApply_RateLimitZeroDisablesCheck(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := New(cfg, store.NewMemory(nil))
+	calls := 0
+	forward := func(ctx context.Context) (int, []byte, error) {
+		calls++
+		return 200, []byte("{}"), nil
+	}
+	for i := 0; i < 100; i++ {
+		body := []byte(fmt.Sprintf(`{"to":"caller-%d@b.com"}`, i))
+		_, _ = pl.Apply(context.Background(), "send_email", body, forward)
+	}
+	if calls != 100 {
+		t.Errorf("RPS=0 should disable rate limiting; got %d forwards out of 100", calls)
+	}
+}
+
+func TestDecision_RateLimitedString(t *testing.T) {
+	if DecisionRateLimited.String() != "rate_limited" {
+		t.Errorf("DecisionRateLimited.String() = %q, want rate_limited", DecisionRateLimited.String())
+	}
+}
+
 func TestApply_LeaderPanicDoesNotDeadlockWaiters(t *testing.T) {
 	// If the leader's forward closure panics, every coalesced sibling waiting
 	// on its done channel must receive a clean error response instead of
