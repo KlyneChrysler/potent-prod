@@ -1,0 +1,9 @@
+# Release Dockerfile — consumed by goreleaser with a minimal build context
+# that contains only the pre-built `potent` binary plus the files listed under
+# `dockers.extra_files` in .goreleaser.yaml. For source builds, use Dockerfile.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY potent /potent
+COPY configs/policy.yaml /configs/policy.yaml
+USER nonroot:nonroot
+EXPOSE 8080 9090
+ENTRYPOINT ["/potent", "-policy", "/configs/policy.yaml"]
