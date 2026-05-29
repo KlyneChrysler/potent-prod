@@ -94,6 +94,19 @@ Sends are buffered through a 1024-deep channel; the writer goroutine drains
 the buffer on shutdown. Disk full or slow downstream applies backpressure to
 the request path.
 
+## Tracing
+
+potent speaks the [W3C Trace Context](https://www.w3.org/TR/trace-context/) `traceparent` header on every HTTP and MCP HTTP request:
+
+- If the inbound request carries a valid `traceparent`, potent preserves the trace id and generates a fresh span id for its hop.
+- If the header is missing or malformed, potent generates a brand new context, marked sampled.
+- The chosen context is echoed back on the response so the caller can correlate.
+- Outbound requests to upstream propagate the context unchanged so the operator's distributed-tracing backend (Datadog, Honeycomb, Jaeger, Tempo, etc.) sees one trace across agent + potent + upstream.
+
+The structured log handler injects `trace_id` and `span_id` into every record whose context carries a span, so log lines correlate with the spans without any backend-specific code. Audit log records carry the `trace_id` for compliance correlation.
+
+No OpenTelemetry SDK is bundled today; the operator's collector can scrape the proxy headers and the slog output independently. The W3C header shape and the audit field name will stay stable when (and if) a full OTLP exporter is added.
+
 ## Shadow mode
 
 Start potent with `-shadow-mode` and every tool call is forwarded to upstream regardless of policy: no replays, no blocks, no rate-limit rejections, no ACL forbiddens. The audit log records what the policy *would* have done.
