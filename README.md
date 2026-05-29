@@ -190,11 +190,26 @@ kubectl apply -f https://github.com/KlyneChrysler/potent-prod/raw/main/deploy/k8
 
 You don't want a sidecar that adds 50ms to every tool call. Potent is built to add under 5ms on a cache hit. Single static binary, no runtime to install, no Python environment to fight, no NPM tree to audit. The whole thing is under 10MB.
 
+## How well does the semantic tier actually work
+
+Honest answer: we measured it. See [docs/eval/results.md](./docs/eval/results.md) for the numbers, [docs/eval/methodology.md](./docs/eval/methodology.md) for how the dataset was built. Highlights:
+
+- Normalized whitespace, casing, and word-reorder retries are caught reliably.
+- Real paraphrases are caught partially. The hashing-TFIDF embedder has a precision/recall tradeoff that depends on the tool.
+- For payments and other structured tools, the semantic tier is at best neutral and at worst harmful. The example policy ships with `semantic_threshold: 0` (exact-only) for those.
+- For text-heavy tools like `send_email`, threshold around 0.73 maximizes F1 in our dataset. Re-run `potent-eval` against your own data and tune.
+
+Run the harness yourself:
+
+```
+make eval
+```
+
 ## Honest about what's pre 1.0
 
-This is v0.1.0. It works and the tests prove it, but real users will find bugs the tests didn't.
+This is v0.1.x. It works and the tests prove the mechanism, the eval honestly grades the embedder.
 
-- The semantic matcher is a hashing TF-IDF embedder. It catches normalized duplicates great. When you need true transformer semantics, the ONNX swap is a one file change behind the `Embedder` interface.
+- The semantic matcher is a hashing TF-IDF embedder. The eval shows it earns its keep on whitespace/casing/reorder retries but is mediocre on heavy paraphrases. ONNX/transformer swap behind the `Embedder` interface is the next step; we'll re-publish the eval when it lands.
 - The cosine search is brute force over the per tool cache. Fine until your per tool cache hits 10k entries, then we'll add an ANN index.
 - No automatic policy suggestion from MCP `tools/list` schemas yet. Coming.
 

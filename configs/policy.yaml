@@ -5,11 +5,17 @@
 #   cache    - cache and replay (for read-only tools)
 #   log_only - detect duplicates, log them, but pass through
 #   off      - disable potent for this tool
+#
+# Note on semantic_threshold: the values below are calibrated against the
+# curated dataset in docs/eval/dataset.jsonl. The numbers are honest but
+# the dataset is small. For production, re-run the eval against your own
+# captured traffic (see docs/eval/methodology.md) and tune per tool.
 
 defaults:
   mode: log_only
   ttl: 1h
-  semantic_threshold: 0.94
+  # 0 disables the semantic tier; exact-match fingerprint is always on.
+  semantic_threshold: 0
 
 tools:
   send_email:
@@ -20,7 +26,10 @@ tools:
       subject: [trim, collapse_whitespace]
       body: [trim]
     fingerprint_fields: [to, subject, body]
-    semantic_threshold: 0.94
+    # best F1 against the curated dataset; eval reported recall 1.0 and
+    # FPR 0.128. raise toward 0.9 for less risk of false-block; expect to
+    # lose paraphrase recall in exchange.
+    semantic_threshold: 0.73
 
   charge_card:
     mode: strict
@@ -29,17 +38,25 @@ tools:
       customer_id: [trim]
       amount_cents: []
     fingerprint_fields: [customer_id, amount_cents, currency]
-    semantic_threshold: 0.99   # higher bar for money
+    # eval showed the semantic tier produced 5 false positives on
+    # adversarial cases (different amount, different customer). recommend
+    # exact-only until an ONNX embedder ships.
+    semantic_threshold: 0
 
   search_web:
     mode: cache
     ttl: 5m
     fingerprint_fields: [query]
+    # cache mode for read-only; lower recall is acceptable because a
+    # missed dedup is just a second search, not a duplicate side effect.
+    semantic_threshold: 0.81
 
   delete_user:
     mode: strict
     ttl: 7d
     fingerprint_fields: [user_id]
+    # single-field id; exact match already catches every duplicate.
+    semantic_threshold: 0
     require_human_confirm_on_replay: true
 
   log_event:
