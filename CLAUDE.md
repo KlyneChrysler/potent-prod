@@ -56,6 +56,7 @@ Pure-function packages (`normalizer`, `fingerprint`, `policy`) are written test-
 - Feature branches: `klyne/<short-desc>`
 - PR template: goal / summary / design decisions / edge cases / test plan
 - Commits attributed to Klyne only. No Co-Authored-By.
+- **Always open PRs as the `KlyneChrysler` account.** Before `gh pr create`, run `gh auth status` and if the active account is not `KlyneChrysler`, run `gh auth switch --user KlyneChrysler` first. Do not open PRs from `chalory` or any other account.
 
 ## Operational
 
