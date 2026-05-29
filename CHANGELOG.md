@@ -5,6 +5,9 @@ All notable changes to potent are documented here. Format follows [Keep a Change
 ## [Unreleased]
 
 ### Added
+- Semantic-dedup eval harness `cmd/potent-eval`. Reads a labelled jsonl dataset (`docs/eval/dataset.jsonl`) and reports precision/recall/FPR at every candidate threshold so `semantic_threshold` is calibrated against data instead of guessed. CI runs the harness on every push and uploads the json artifact for regression tracking. The methodology, results, and recommended per-tool defaults are in `docs/eval/`.
+- Multi-tenant tokens (`-api-tokens-file`) plus per-tool `allowed_callers` ACLs.
+- mTLS to upstream via `-upstream-ca`, `-upstream-cert`, `-upstream-key`.
 - Proxy-port bearer auth. The `http` and `mcp-http` modes accept an optional `POTENT_API_TOKEN`; when set, every inbound request must carry `Authorization: Bearer <token>`. Constant-time comparison. The process refuses to start with an unauthenticated proxy bound to a non-loopback address.
 - Per-tool rate limiting. `RateLimit { RPS, Burst }` in the policy YAML. Token-bucket via `golang.org/x/time/rate`. Excess requests return `429` (HTTP) or JSON-RPC `-32005` (MCP HTTP). `RPS=0` disables.
 - `/readyz` health endpoint separate from `/healthz`. Liveness vs readiness so Kubernetes can distinguish "restart" from "stop sending traffic".

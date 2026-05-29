@@ -1,0 +1,64 @@
+{"id":"se-q3-alice-baseline","tool":"send_email","intent_id":"se-q3-alice","category":"baseline","args":{"to":"alice@example.com","subject":"Q3 financial report","body":"Hi Alice, please find the Q3 financial report attached for your review. Let me know if you have any questions about the numbers."}}
+{"id":"se-q3-alice-ws","tool":"send_email","intent_id":"se-q3-alice","category":"whitespace-casing","args":{"to":" Alice@Example.com ","subject":"  Q3 financial   report  ","body":"Hi Alice, please find the Q3 financial report attached for your review. Let me know if you have any questions about the numbers."}}
+{"id":"se-q3-alice-reorder","tool":"send_email","intent_id":"se-q3-alice","category":"reorder","args":{"to":"alice@example.com","subject":"Q3 financial report","body":"Please find the Q3 financial report attached, Alice. Let me know if you have questions about the numbers. Hi!"}}
+{"id":"se-q3-alice-synonym","tool":"send_email","intent_id":"se-q3-alice","category":"synonym","args":{"to":"alice@example.com","subject":"Q3 financial report","body":"Hi Alice, please see the attached Q3 financial report for your review. Reach out if you have questions about the figures."}}
+{"id":"se-q3-alice-paraphrase","tool":"send_email","intent_id":"se-q3-alice","category":"paraphrase","args":{"to":"alice@example.com","subject":"Q3 financial report","body":"Alice, attached is the Q3 financial report. Please take a look and reply with any questions you have on the data."}}
+
+{"id":"se-q4-alice-baseline","tool":"send_email","intent_id":"se-q4-alice","category":"baseline","args":{"to":"alice@example.com","subject":"Q4 financial report","body":"Hi Alice, please find the Q4 financial report attached for your review. Let me know if you have any questions about the numbers."}}
+{"id":"se-q3-bob-baseline","tool":"send_email","intent_id":"se-q3-bob","category":"baseline","args":{"to":"bob@example.com","subject":"Q3 financial report","body":"Hi Bob, please find the Q3 financial report attached for your review. Let me know if you have any questions about the numbers."}}
+{"id":"se-q3-alice-different-action","tool":"send_email","intent_id":"se-q3-alice-no-attach","category":"adversarial-different-intent","args":{"to":"alice@example.com","subject":"Q3 financial report","body":"Hi Alice, the Q3 financial report is delayed. I'll send it as soon as I can review the numbers. Let me know if you need anything in the meantime."}}
+
+{"id":"se-meet-mon-baseline","tool":"send_email","intent_id":"se-meet-mon","category":"baseline","args":{"to":"carol@example.com","subject":"Monday meeting confirmation","body":"Carol, confirming our meeting Monday at 10am to discuss the roadmap. The room is booked and the agenda is in the calendar invite."}}
+{"id":"se-meet-mon-ws","tool":"send_email","intent_id":"se-meet-mon","category":"whitespace-casing","args":{"to":" Carol@Example.com ","subject":"monday meeting CONFIRMATION","body":"Carol, confirming our meeting Monday at 10am to discuss the roadmap. The room is booked and the agenda is in the calendar invite."}}
+{"id":"se-meet-mon-reorder","tool":"send_email","intent_id":"se-meet-mon","category":"reorder","args":{"to":"carol@example.com","subject":"Monday meeting confirmation","body":"The agenda is in the calendar invite and the room is booked. Confirming our roadmap meeting Monday at 10am, Carol."}}
+{"id":"se-meet-mon-synonym","tool":"send_email","intent_id":"se-meet-mon","category":"synonym","args":{"to":"carol@example.com","subject":"Monday meeting confirmation","body":"Carol, confirming our discussion Monday at 10am about the roadmap. The room is reserved and the agenda is in the calendar entry."}}
+{"id":"se-meet-tue","tool":"send_email","intent_id":"se-meet-tue","category":"adversarial-different-day","args":{"to":"carol@example.com","subject":"Tuesday meeting confirmation","body":"Carol, confirming our meeting Tuesday at 10am to discuss the roadmap. The room is booked and the agenda is in the calendar invite."}}
+
+{"id":"se-onboard-baseline","tool":"send_email","intent_id":"se-onboard-david","category":"baseline","args":{"to":"david@example.com","subject":"Welcome to the team","body":"Hi David, welcome aboard. Your laptop is on your desk and the onboarding doc is in shared drive. Reach out if anything is missing on day one."}}
+{"id":"se-onboard-ws","tool":"send_email","intent_id":"se-onboard-david","category":"whitespace-casing","args":{"to":"David@Example.com","subject":"Welcome to the Team","body":" Hi David, welcome aboard.  Your laptop is on your desk and the onboarding doc is in shared drive.  Reach out if anything is missing on day one. "}}
+{"id":"se-onboard-paraphrase","tool":"send_email","intent_id":"se-onboard-david","category":"paraphrase","args":{"to":"david@example.com","subject":"Welcome to the team","body":"David, welcome to the team. You'll find your laptop on your desk and the onboarding instructions on the shared drive. Let me know on day one if anything is missing."}}
+{"id":"se-offboard","tool":"send_email","intent_id":"se-offboard-david","category":"adversarial-opposite-intent","args":{"to":"david@example.com","subject":"Offboarding next steps","body":"Hi David, sorry to see you go. Please return your laptop to your desk and remove your files from shared drive. Reach out if anything is unclear on your last day."}}
+
+{"id":"cc-100-baseline","tool":"charge_card","intent_id":"cc-acme-100","category":"baseline","args":{"customer_id":"cus_acme_123","amount_cents":10000,"currency":"USD","memo":"Monthly subscription renewal - October"}}
+{"id":"cc-100-ws","tool":"charge_card","intent_id":"cc-acme-100","category":"whitespace-casing","args":{"customer_id":" cus_acme_123 ","amount_cents":10000,"currency":"usd","memo":"  Monthly  subscription renewal -  October  "}}
+{"id":"cc-100-synonym","tool":"charge_card","intent_id":"cc-acme-100","category":"synonym","args":{"customer_id":"cus_acme_123","amount_cents":10000,"currency":"USD","memo":"Monthly subscription billing - October"}}
+
+{"id":"cc-110-amount","tool":"charge_card","intent_id":"cc-acme-110","category":"adversarial-different-amount","args":{"customer_id":"cus_acme_123","amount_cents":11000,"currency":"USD","memo":"Monthly subscription renewal - October"}}
+{"id":"cc-100-nov","tool":"charge_card","intent_id":"cc-acme-100-nov","category":"adversarial-different-period","args":{"customer_id":"cus_acme_123","amount_cents":10000,"currency":"USD","memo":"Monthly subscription renewal - November"}}
+{"id":"cc-100-other","tool":"charge_card","intent_id":"cc-other-100","category":"adversarial-different-customer","args":{"customer_id":"cus_globex_456","amount_cents":10000,"currency":"USD","memo":"Monthly subscription renewal - October"}}
+
+{"id":"cc-refund-baseline","tool":"charge_card","intent_id":"cc-refund-x","category":"baseline","args":{"customer_id":"cus_initech_789","amount_cents":-5000,"currency":"EUR","memo":"Partial refund for incident on 2026-04-12"}}
+{"id":"cc-refund-paraphrase","tool":"charge_card","intent_id":"cc-refund-x","category":"paraphrase","args":{"customer_id":"cus_initech_789","amount_cents":-5000,"currency":"EUR","memo":"Refund (partial) for the 2026-04-12 incident"}}
+{"id":"cc-refund-other-incident","tool":"charge_card","intent_id":"cc-refund-y","category":"adversarial-different-date","args":{"customer_id":"cus_initech_789","amount_cents":-5000,"currency":"EUR","memo":"Partial refund for incident on 2026-05-02"}}
+
+{"id":"ct-roadmap-baseline","tool":"create_task","intent_id":"ct-roadmap-q4","category":"baseline","args":{"title":"Draft Q4 roadmap","description":"Pull together a draft of the Q4 product roadmap with priority items and rough estimates. Share with leads by end of week.","assignee":"eve@example.com","priority":"high"}}
+{"id":"ct-roadmap-ws","tool":"create_task","intent_id":"ct-roadmap-q4","category":"whitespace-casing","args":{"title":"draft Q4 ROADMAP","description":" Pull together a draft of the Q4 product roadmap with priority items and rough estimates.  Share with leads by end of week. ","assignee":"Eve@Example.com","priority":"high"}}
+{"id":"ct-roadmap-reorder","tool":"create_task","intent_id":"ct-roadmap-q4","category":"reorder","args":{"title":"Draft Q4 roadmap","description":"Share with leads by end of week. Pull together a draft of the Q4 product roadmap with priority items and rough estimates.","assignee":"eve@example.com","priority":"high"}}
+{"id":"ct-roadmap-paraphrase","tool":"create_task","intent_id":"ct-roadmap-q4","category":"paraphrase","args":{"title":"Draft Q4 roadmap","description":"Put together a first draft of the Q4 product roadmap including prioritized items and rough estimates. Get it to the leads by the end of this week.","assignee":"eve@example.com","priority":"high"}}
+
+{"id":"ct-roadmap-low","tool":"create_task","intent_id":"ct-roadmap-q4-low","category":"adversarial-different-priority","args":{"title":"Draft Q4 roadmap","description":"Pull together a draft of the Q4 product roadmap with priority items and rough estimates. Share with leads by end of week.","assignee":"eve@example.com","priority":"low"}}
+{"id":"ct-roadmap-q3","tool":"create_task","intent_id":"ct-roadmap-q3","category":"adversarial-different-quarter","args":{"title":"Draft Q3 roadmap","description":"Pull together a draft of the Q3 product roadmap with priority items and rough estimates. Share with leads by end of week.","assignee":"eve@example.com","priority":"high"}}
+
+{"id":"ct-onboarding-baseline","tool":"create_task","intent_id":"ct-onboard-david","category":"baseline","args":{"title":"Onboard new hire David","description":"Run David through onboarding: laptop setup, code repos access, payroll, intro meetings with the team leads, and the engineering doc walkthrough.","assignee":"frank@example.com","priority":"medium"}}
+{"id":"ct-onboarding-paraphrase","tool":"create_task","intent_id":"ct-onboard-david","category":"paraphrase","args":{"title":"Onboard new hire David","description":"Walk David through the onboarding process: setting up the laptop, granting code repo access, payroll enrollment, introductions with team leads, and a tour of the engineering documentation.","assignee":"frank@example.com","priority":"medium"}}
+{"id":"ct-offboard-david","tool":"create_task","intent_id":"ct-offboard-david","category":"adversarial-opposite-intent","args":{"title":"Offboard David","description":"Run David through offboarding: revoke laptop, remove code repos access, payroll, exit meetings with the team leads, and the documentation handoff.","assignee":"frank@example.com","priority":"medium"}}
+
+{"id":"du-42","tool":"delete_user","intent_id":"du-42","category":"baseline","args":{"user_id":"42"}}
+{"id":"du-42-int","tool":"delete_user","intent_id":"du-42","category":"format-variation","args":{"user_id":42}}
+{"id":"du-43","tool":"delete_user","intent_id":"du-43","category":"adversarial-close-id","args":{"user_id":"43"}}
+{"id":"du-99","tool":"delete_user","intent_id":"du-99","category":"adversarial-different-id","args":{"user_id":"99"}}
+
+{"id":"sw-go-baseline","tool":"search_web","intent_id":"sw-go-prog","category":"baseline","args":{"query":"how to write idiomatic Go code"}}
+{"id":"sw-go-ws","tool":"search_web","intent_id":"sw-go-prog","category":"whitespace-casing","args":{"query":"   how to write idiomatic   GO   code   "}}
+{"id":"sw-go-reorder","tool":"search_web","intent_id":"sw-go-prog","category":"reorder","args":{"query":"how to write Go code idiomatically"}}
+{"id":"sw-go-synonym","tool":"search_web","intent_id":"sw-go-prog","category":"synonym","args":{"query":"how to write idiomatic Go programming"}}
+{"id":"sw-go-paraphrase","tool":"search_web","intent_id":"sw-go-prog","category":"paraphrase","args":{"query":"writing idiomatic Go: a guide"}}
+
+{"id":"sw-rust","tool":"search_web","intent_id":"sw-rust-prog","category":"adversarial-different-topic","args":{"query":"how to write idiomatic Rust code"}}
+{"id":"sw-go-perf","tool":"search_web","intent_id":"sw-go-perf","category":"adversarial-related-but-distinct","args":{"query":"how to optimize Go code performance"}}
+{"id":"sw-go-test","tool":"search_web","intent_id":"sw-go-test","category":"adversarial-related-but-distinct","args":{"query":"how to test idiomatic Go code"}}
+
+{"id":"sw-weather-baseline","tool":"search_web","intent_id":"sw-weather-sf","category":"baseline","args":{"query":"san francisco weather forecast tomorrow"}}
+{"id":"sw-weather-paraphrase","tool":"search_web","intent_id":"sw-weather-sf","category":"paraphrase","args":{"query":"tomorrow forecast for SF weather"}}
+{"id":"sw-weather-ny","tool":"search_web","intent_id":"sw-weather-ny","category":"adversarial-different-city","args":{"query":"new york weather forecast tomorrow"}}
+{"id":"sw-weather-sf-week","tool":"search_web","intent_id":"sw-weather-sf-week","category":"adversarial-different-period","args":{"query":"san francisco weather forecast this week"}}
