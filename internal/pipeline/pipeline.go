@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/potent/potent/internal/audit"
@@ -80,6 +81,22 @@ type Pipeline struct {
 	metrics  *metrics.Metrics
 	audit    *audit.Writer
 	now      func() time.Time
+
+	// inflightMu guards inflight; only Apply mutates the map.
+	inflightMu sync.Mutex
+	// inflight coalesces concurrent Apply calls with the same fingerprint
+	// hash so a single forward() invocation serves every concurrent
+	// duplicate. Without coalescing, three concurrent identical tool calls
+	// would all reach upstream, defeating the whole point of idempotency.
+	inflight map[string]*applyInflight
+}
+
+// applyInflight is what concurrent siblings of a leader Apply call wait on.
+// The leader fills in result + err before closing done; waiters read after.
+type applyInflight struct {
+	done   chan struct{}
+	result Result
+	err    error
 }
 
 // New constructs a Pipeline. Pass nil metrics or embedder to disable those
@@ -89,6 +106,7 @@ func New(p *policy.Config, st store.Store, opts ...Option) *Pipeline {
 		policies: p,
 		store:    st,
 		now:      time.Now,
+		inflight: make(map[string]*applyInflight),
 	}
 	for _, opt := range opts {
 		opt(pl)
@@ -217,35 +235,103 @@ func (p *Pipeline) Apply(ctx context.Context, tool string, body []byte, forward 
 	case DecisionBlock:
 		return Result{Decision: DecisionBlock, Match: match, Hash: entry.Hash, StatusCode: 409}, nil
 	default:
-		start := p.now()
-		status, resp, err := forward(ctx)
-		p.recordUpstreamLatency(tool, p.now().Sub(start).Seconds())
-		if err != nil {
-			return Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}, err
-		}
-		if (pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache) && status >= 200 && status < 300 {
-			var emb []float32
-			if p.embedder != nil && pol.SemanticThreshold > 0 && intent != "" {
-				if v, eerr := p.embedder.Embed(intent); eerr == nil {
-					emb = v
-				}
-			}
-			perr := p.store.Put(ctx, store.Entry{
-				Tool:       tool,
-				Hash:       hash,
-				Request:    body,
-				Response:   resp,
-				StatusCode: status,
-				CreatedAt:  p.now(),
-				TTL:        pol.TTL,
-				Embedding:  emb,
-			})
-			if perr != nil {
-				p.recordStoreError("put")
+		// Coalesce concurrent duplicates so only one of N siblings actually
+		// calls forward(). Strict and cache modes participate; off and
+		// log_only fall through because they always forward by design.
+		if pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache {
+			if res, leader, leaderHandle := p.acquireLeader(hash); !leader {
+				return p.waitForLeader(ctx, res), nil
+			} else {
+				defer p.releaseLeader(hash, leaderHandle)
+				return p.doForward(ctx, tool, hash, intent, pol, body, forward, leaderHandle)
 			}
 		}
-		return Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}, nil
+		return p.doForward(ctx, tool, hash, intent, pol, body, forward, nil)
 	}
+}
+
+// acquireLeader registers an in-flight forward for the given hash. Returns
+// (existing, false, nil) when a sibling is already in flight; (nil, true,
+// handle) when the caller is the new leader and must call doForward.
+func (p *Pipeline) acquireLeader(hash string) (*applyInflight, bool, *applyInflight) {
+	p.inflightMu.Lock()
+	defer p.inflightMu.Unlock()
+	if existing, ok := p.inflight[hash]; ok {
+		return existing, false, nil
+	}
+	h := &applyInflight{done: make(chan struct{})}
+	p.inflight[hash] = h
+	return nil, true, h
+}
+
+// releaseLeader removes the in-flight entry. Called from a defer by the
+// leader so siblings that arrive after this point hit the cache instead.
+func (p *Pipeline) releaseLeader(hash string, h *applyInflight) {
+	p.inflightMu.Lock()
+	if cur, ok := p.inflight[hash]; ok && cur == h {
+		delete(p.inflight, hash)
+	}
+	p.inflightMu.Unlock()
+	close(h.done)
+}
+
+// waitForLeader blocks until the leader's forward + cache write completes,
+// then returns the leader's Result with the waiter's view of the decision.
+func (p *Pipeline) waitForLeader(ctx context.Context, leader *applyInflight) Result {
+	select {
+	case <-leader.done:
+		// Borrow the leader's body/status. Mark as Replay so callers can
+		// distinguish a coalesced response from a fresh forward.
+		r := leader.result
+		r.Decision = DecisionReplay
+		r.Match = Match{Kind: "exact", Similarity: 1.0}
+		return r
+	case <-ctx.Done():
+		return Result{Decision: DecisionForward}
+	}
+}
+
+// doForward calls the upstream forwarder and persists the response. When
+// leaderHandle is non-nil, the result is stored on the handle for siblings
+// waiting on done.
+func (p *Pipeline) doForward(ctx context.Context, tool, hash, intent string, pol policy.ToolPolicy, body []byte, forward Forwarder, leaderHandle *applyInflight) (Result, error) {
+	start := p.now()
+	status, resp, err := forward(ctx)
+	p.recordUpstreamLatency(tool, p.now().Sub(start).Seconds())
+	if err != nil {
+		res := Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}
+		if leaderHandle != nil {
+			leaderHandle.result = res
+			leaderHandle.err = err
+		}
+		return res, err
+	}
+	if (pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache) && status >= 200 && status < 300 {
+		var emb []float32
+		if p.embedder != nil && pol.SemanticThreshold > 0 && intent != "" {
+			if v, eerr := p.embedder.Embed(intent); eerr == nil {
+				emb = v
+			}
+		}
+		perr := p.store.Put(ctx, store.Entry{
+			Tool:       tool,
+			Hash:       hash,
+			Request:    body,
+			Response:   resp,
+			StatusCode: status,
+			CreatedAt:  p.now(),
+			TTL:        pol.TTL,
+			Embedding:  emb,
+		})
+		if perr != nil {
+			p.recordStoreError("put")
+		}
+	}
+	res := Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}
+	if leaderHandle != nil {
+		leaderHandle.result = res
+	}
+	return res, nil
 }
 
 func (p *Pipeline) decide(ctx context.Context, tool, hash string, pol policy.ToolPolicy, intent string) (Decision, store.Entry, Match) {
