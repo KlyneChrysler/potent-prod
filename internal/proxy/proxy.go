@@ -19,6 +19,7 @@ import (
 
 	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/pipeline"
+	"github.com/potent/potent/internal/tracing"
 )
 
 // ToolHeader is the request header the client sets to tell the proxy which
@@ -109,18 +110,32 @@ func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...
 		tp.TLSClientConfig = p.upstreamTLS
 		p.upstream.Transport = tp
 	}
+	// Chain a director that propagates the W3C traceparent header from the
+	// request context into every outbound request so the operator's
+	// tracing backend sees a single trace across agent + potent + upstream.
+	prevDirector := p.upstream.Director
+	p.upstream.Director = func(req *http.Request) {
+		prevDirector(req)
+		if sc, ok := tracing.FromContext(req.Context()); ok && sc.Valid() {
+			tracing.InjectInto(req, sc)
+		}
+	}
 	return p
 }
 
-// Handler returns the proxy wrapped with bearer-token auth when an API
-// token is configured. Mount this rather than the bare Proxy on the
-// public-facing ServeMux so the token check runs ahead of every request.
-// Multi-tenant (apiTokens) takes precedence over single-token (apiToken).
+// Handler returns the proxy wrapped with bearer-token auth and W3C
+// trace-context middleware. Mount this rather than the bare Proxy on the
+// public-facing ServeMux so auth, tracing, and (downstream) the dedup
+// pipeline all see consistent context. Multi-tenant (apiTokens) takes
+// precedence over single-token (apiToken).
 func (p *Proxy) Handler() http.Handler {
+	var inner http.Handler = p
 	if len(p.apiTokens) > 0 {
-		return auth.RequireBearerCallers(p.apiTokens, "potent", p)
+		inner = auth.RequireBearerCallers(p.apiTokens, "potent", inner)
+	} else {
+		inner = auth.RequireBearer(p.apiToken, "potent", inner)
 	}
-	return auth.RequireBearer(p.apiToken, "potent", p)
+	return tracing.Middleware(inner)
 }
 
 // ServeHTTP implements http.Handler.
@@ -154,12 +169,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	caller := auth.CallerFromContext(r.Context())
 	res, err := p.pipeline.Apply(r.Context(), tool, caller, body, forward)
 	if err != nil {
-		p.logger.Warn("pipeline apply", "err", err, "tool", tool)
+		p.logger.WarnContext(r.Context(), "pipeline apply", "err", err, "tool", tool)
 		http.Error(w, "pipeline error", http.StatusInternalServerError)
 		return
 	}
 
-	p.logger.Info("policy decision",
+	p.logger.InfoContext(r.Context(), "policy decision",
 		"tool", tool,
 		"hash", res.Hash,
 		"decision", res.Decision.String(),

@@ -37,6 +37,12 @@ type Record struct {
 	// have chosen if shadow had been off.
 	Shadow        bool   `json:"shadow,omitempty"`
 	WouldDecision string `json:"would_decision,omitempty"`
+
+	// TraceID is the W3C trace-context trace-id under which the decision
+	// was made, when known. Carrying it through audit makes it possible
+	// for operators to correlate a particular replay/block decision with
+	// the rest of the request span in Datadog/Honeycomb/Jaeger.
+	TraceID string `json:"trace_id,omitempty"`
 }
 
 // Writer accepts records on a buffered channel. Construct via Open or

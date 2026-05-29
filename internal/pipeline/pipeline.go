@@ -24,6 +24,7 @@ import (
 
 	"github.com/potent/potent/internal/audit"
 	"github.com/potent/potent/internal/embed"
+	"github.com/potent/potent/internal/tracing"
 	"github.com/potent/potent/internal/fingerprint"
 	"github.com/potent/potent/internal/metrics"
 	"github.com/potent/potent/internal/normalizer"
@@ -192,7 +193,7 @@ func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte)
 
 	if !pol.AllowsCaller(caller) {
 		p.recordDecision(tool, pol.Mode, DecisionForbidden)
-		p.writeAudit(tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
+		p.writeAudit(ctx, tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
 		if p.shadow {
 			return Result{Decision: DecisionForward}, "", nil
 		}
@@ -201,7 +202,7 @@ func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte)
 
 	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
 		p.recordDecision(tool, pol.Mode, DecisionRateLimited)
-		p.writeAudit(tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
+		p.writeAudit(ctx, tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
 		if p.shadow {
 			return Result{Decision: DecisionForward}, "", nil
 		}
@@ -215,7 +216,7 @@ func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte)
 
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
 	p.recordDecision(tool, pol.Mode, decision)
-	p.writeAudit(tool, string(pol.Mode), decision, match, hash, entry.Hash)
+	p.writeAudit(ctx, tool, string(pol.Mode), decision, match, hash, entry.Hash)
 
 	// In shadow mode the mcp-stdio adapter must always forward to the child
 	// server. The Cache call after the child responds will populate the
@@ -295,7 +296,7 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 
 	if !pol.AllowsCaller(caller) {
 		p.recordDecision(tool, pol.Mode, DecisionForbidden)
-		p.writeAudit(tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
+		p.writeAudit(ctx, tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
 		if p.shadow {
 			return p.shadowForward(ctx, tool, "", "", pol, body, forward)
 		}
@@ -304,7 +305,7 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 
 	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
 		p.recordDecision(tool, pol.Mode, DecisionRateLimited)
-		p.writeAudit(tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
+		p.writeAudit(ctx, tool, string(pol.Mode), DecisionRateLimited, Match{}, "", "")
 		if p.shadow {
 			return p.shadowForward(ctx, tool, "", "", pol, body, forward)
 		}
@@ -318,7 +319,7 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
 	p.recordDecision(tool, pol.Mode, decision)
-	p.writeAudit(tool, string(pol.Mode), decision, match, hash, entry.Hash)
+	p.writeAudit(ctx, tool, string(pol.Mode), decision, match, hash, entry.Hash)
 
 	// In shadow mode every decision becomes Forward on the wire while the
 	// audit log keeps the policy's view. The cache still gets written so a
@@ -574,7 +575,7 @@ func (p *Pipeline) recordStoreError(op string) {
 	p.metrics.StoreErrors.WithLabelValues(op).Inc()
 }
 
-func (p *Pipeline) writeAudit(tool, mode string, d Decision, match Match, freshHash, entryHash string) {
+func (p *Pipeline) writeAudit(ctx context.Context, tool, mode string, d Decision, match Match, freshHash, entryHash string) {
 	if p.audit == nil {
 		return
 	}
@@ -589,6 +590,9 @@ func (p *Pipeline) writeAudit(tool, mode string, d Decision, match Match, freshH
 		Match:      match.Kind,
 		Similarity: match.Similarity,
 		Hash:       h,
+	}
+	if sc, ok := tracing.FromContext(ctx); ok && sc.Valid() {
+		rec.TraceID = sc.TraceID
 	}
 	if p.shadow {
 		// In shadow mode every call is forwarded regardless of policy. The
