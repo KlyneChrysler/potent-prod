@@ -68,7 +68,10 @@ func run() error {
 
 	adminToken := os.Getenv("POTENT_ADMIN_TOKEN")
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// Log to stderr. In mcp-stdio mode, stdout is the JSON-RPC protocol
+	// channel and any non-protocol byte on it corrupts the stream. Stderr
+	// is the conventional log sink anyway, so all modes get it.
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
 	if *upstream == "" {
