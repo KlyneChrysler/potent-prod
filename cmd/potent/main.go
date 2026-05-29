@@ -64,6 +64,8 @@ func run() error {
 	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
 	auditPath := flag.String("audit-log", "", "append JSONL audit records to this path (empty = disabled)")
 	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled; recommend 127.0.0.1:9095)")
+	maxBodyBytes := flag.Int64("max-body-bytes", 1<<20, "cap on inbound tool-call request bodies (0 = unlimited; recommend leaving the default)")
+	stdioTimeout := flag.Duration("stdio-request-timeout", 60*time.Second, "how long an in-flight mcp-stdio tools/call may wait for a response before being treated as failed")
 	flag.Parse()
 
 	adminToken := os.Getenv("POTENT_ADMIN_TOKEN")
@@ -134,43 +136,44 @@ func run() error {
 
 	switch *mode {
 	case "http":
-		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger)
+		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes)
 	case "mcp-http":
-		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger)
+		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes)
 	case "mcp-stdio":
-		return runMCPStdio(*upstream, pl, logger)
+		return runMCPStdio(*upstream, pl, logger, *stdioTimeout)
 	default:
 		return fmt.Errorf("unknown mode %q (want http | mcp-http | mcp-stdio)", *mode)
 	}
 }
 
-func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger) error {
+func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	p := proxy.New(pl, u, logger)
+	p := proxy.New(pl, u, logger, proxy.WithMaxBodyBytes(maxBody))
 	return serveDual(addr, metricsAddr, p, m, "http", upstream, logger)
 }
 
-func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger) error {
+func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	h := mcp.NewHTTPHandler(pl, u, logger)
+	h := mcp.NewHTTPHandler(pl, u, logger, mcp.WithHTTPMaxBodyBytes(maxBody))
 	return serveDual(addr, metricsAddr, h, m, "mcp-http", upstream, logger)
 }
 
-func runMCPStdio(cmd string, pl *pipeline.Pipeline, logger *slog.Logger) error {
+func runMCPStdio(cmd string, pl *pipeline.Pipeline, logger *slog.Logger, timeout time.Duration) error {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return errors.New("mcp-stdio: -upstream must be a command to exec")
 	}
 	h := mcp.NewStdioHandler(pl, parts[0], parts[1:], logger)
+	h.SetRequestTimeout(timeout)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	logger.Info("potent mcp-stdio starting", "cmd", cmd)
+	logger.Info("potent mcp-stdio starting", "cmd", cmd, "request_timeout", timeout)
 	return h.Run(ctx, os.Stdin, os.Stdout)
 }
 
