@@ -39,6 +39,7 @@ const (
 	DecisionReplay
 	DecisionBlock
 	DecisionRateLimited
+	DecisionForbidden
 )
 
 func (d Decision) String() string {
@@ -51,6 +52,8 @@ func (d Decision) String() string {
 		return "block"
 	case DecisionRateLimited:
 		return "rate_limited"
+	case DecisionForbidden:
+		return "forbidden"
 	}
 	return "unknown"
 }
@@ -159,17 +162,24 @@ func WithClock(c func() time.Time) Option   { return func(p *Pipeline) { p.now =
 func WithAudit(a *audit.Writer) Option      { return func(p *Pipeline) { p.audit = a } }
 
 // Lookup evaluates policy + cache without calling upstream. Returns the
-// decision (Replay/Block/Forward/RateLimited), the cached entry if
-// applicable, and the hash/intent the caller needs to later store a fresh
-// response.
+// decision (Replay/Block/Forward/RateLimited/Forbidden), the cached entry
+// if applicable, and the hash/intent the caller needs to later store a
+// fresh response. Caller carries the authenticated caller-id and gates
+// per-tool ACLs; pass "" for anonymous mode.
 //
 // Forward callers (HTTP, MCP-HTTP) typically use Apply; bidirectional
 // transports (MCP stdio) split lookup from caching because the response
 // arrives on a separate pipe after the forwarded request.
-func (p *Pipeline) Lookup(ctx context.Context, tool string, body []byte) (Result, string, error) {
+func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte) (Result, string, error) {
 	pol := p.policies.For(tool)
 	if pol.Mode == policy.ModeOff {
 		return Result{Decision: DecisionForward}, "", nil
+	}
+
+	if !pol.AllowsCaller(caller) {
+		p.recordDecision(tool, pol.Mode, DecisionForbidden)
+		p.writeAudit(tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
+		return Result{Decision: DecisionForbidden, StatusCode: 403}, "", nil
 	}
 
 	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {
@@ -246,12 +256,20 @@ func (p *Pipeline) Cache(ctx context.Context, tool string, body []byte, status i
 
 // Apply runs the idempotency pipeline for a tool call. Body is the raw
 // JSON arguments object; forward is invoked only when the policy requires
-// reaching the upstream.
-func (p *Pipeline) Apply(ctx context.Context, tool string, body []byte, forward Forwarder) (Result, error) {
+// reaching the upstream. Caller is the authenticated caller-id (from the
+// auth middleware) and is used to enforce per-tool ACLs and to label
+// audit records; pass "" when running in anonymous/single-tenant mode.
+func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, forward Forwarder) (Result, error) {
 	pol := p.policies.For(tool)
 	if pol.Mode == policy.ModeOff {
 		status, resp, err := forward(ctx)
 		return Result{Decision: DecisionForward, StatusCode: status, Body: resp}, err
+	}
+
+	if !pol.AllowsCaller(caller) {
+		p.recordDecision(tool, pol.Mode, DecisionForbidden)
+		p.writeAudit(tool, string(pol.Mode), DecisionForbidden, Match{}, "", "")
+		return Result{Decision: DecisionForbidden, StatusCode: 403}, nil
 	}
 
 	if l := p.limiterFor(tool, pol.RateLimit); l != nil && !l.Allow() {

@@ -56,6 +56,30 @@ func TestFor_MergesDefaultsForUnsetFields(t *testing.T) {
 	}
 }
 
+func TestToolPolicy_AllowsCaller(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed []string
+		caller  string
+		want    bool
+	}{
+		{"empty list permits any caller", nil, "team-eng", true},
+		{"empty list permits anonymous", nil, "", true},
+		{"explicit allow matches", []string{"team-eng"}, "team-eng", true},
+		{"explicit allow rejects others", []string{"team-eng"}, "team-marketing", false},
+		{"empty caller rejected by non-empty list", []string{"team-eng"}, "", false},
+		{"multiple entries one match", []string{"team-eng", "team-finance"}, "team-finance", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := ToolPolicy{AllowedCallers: c.allowed}
+			if got := p.AllowsCaller(c.caller); got != c.want {
+				t.Errorf("AllowsCaller(%q) with %v = %v, want %v", c.caller, c.allowed, got, c.want)
+			}
+		})
+	}
+}
+
 func TestModes_StringValues(t *testing.T) {
 	tests := []struct {
 		mode Mode

@@ -3,6 +3,7 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ type HTTPHandler struct {
 	logger       *slog.Logger
 	maxBodyBytes int64
 	apiToken     string
+	apiTokens    map[string]string
 }
 
 // HTTPOption configures an HTTPHandler at construction time.
@@ -46,6 +48,26 @@ func WithHTTPMaxBodyBytes(n int64) HTTPOption {
 // token validation. An empty token disables auth.
 func WithHTTPAPIToken(token string) HTTPOption {
 	return func(h *HTTPHandler) { h.apiToken = token }
+}
+
+// WithHTTPAPITokensFile installs a multi-tenant token map. The matched
+// caller-id is attached to the request context for ACL enforcement.
+func WithHTTPAPITokensFile(tokens map[string]string) HTTPOption {
+	return func(h *HTTPHandler) { h.apiTokens = tokens }
+}
+
+// WithHTTPUpstreamTLS sets the TLS configuration for the http.Client that
+// the handler uses when forwarding to the upstream MCP server. Pass nil
+// for the default (system trust store, no client cert).
+func WithHTTPUpstreamTLS(cfg *tls.Config) HTTPOption {
+	return func(h *HTTPHandler) {
+		if cfg == nil {
+			return
+		}
+		tp := http.DefaultTransport.(*http.Transport).Clone()
+		tp.TLSClientConfig = cfg
+		h.client = &http.Client{Transport: tp}
+	}
 }
 
 // NewHTTPHandler constructs the MCP HTTP adapter.
@@ -68,7 +90,11 @@ func NewHTTPHandler(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logge
 
 // Handler returns the MCP HTTP handler wrapped with bearer-token auth when
 // an API token is configured. Mount this rather than the bare HTTPHandler.
+// Multi-tenant (apiTokens) takes precedence over single-token (apiToken).
 func (h *HTTPHandler) Handler() http.Handler {
+	if len(h.apiTokens) > 0 {
+		return auth.RequireBearerCallers(h.apiTokens, "potent-mcp", h)
+	}
 	return auth.RequireBearer(h.apiToken, "potent-mcp", h)
 }
 
@@ -115,7 +141,8 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return h.forwardOnce(ctx, r, body)
 	}
 
-	res, err := h.pipeline.Apply(r.Context(), tool, args, forward)
+	caller := auth.CallerFromContext(r.Context())
+	res, err := h.pipeline.Apply(r.Context(), tool, caller, args, forward)
 	if err != nil {
 		h.logger.Warn("pipeline apply", "err", err, "tool", tool)
 		h.writeRPCError(w, msg.ID, -32603, "pipeline error")
@@ -132,6 +159,11 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Potent-Hash", res.Hash)
 	w.Header().Set("Content-Type", "application/json")
 	switch res.Decision {
+	case pipeline.DecisionForbidden:
+		w.WriteHeader(http.StatusOK)
+		blocked := NewErrorResponse(msg.ID, -32003, "tool not allowed for caller")
+		_ = json.NewEncoder(w).Encode(blocked)
+		return
 	case pipeline.DecisionRateLimited:
 		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusOK)

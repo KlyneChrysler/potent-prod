@@ -57,6 +57,59 @@ func TestRequireBearer_AcceptsCorrect(t *testing.T) {
 	}
 }
 
+func TestRequireBearerCallers_AttachesCallerToContext(t *testing.T) {
+	var seen string
+	h := RequireBearerCallers(
+		map[string]string{"tok-A": "team-eng", "tok-B": "team-finance"},
+		"",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = CallerFromContext(r.Context())
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer tok-B")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", w.Result().StatusCode)
+	}
+	if seen != "team-finance" {
+		t.Errorf("caller in ctx = %q, want team-finance", seen)
+	}
+}
+
+func TestRequireBearerCallers_RejectsUnknownToken(t *testing.T) {
+	h := RequireBearerCallers(
+		map[string]string{"tok-A": "team-eng"}, "",
+		http.HandlerFunc(ok),
+	)
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer nope")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("unknown token = %d, want 401", w.Result().StatusCode)
+	}
+}
+
+func TestRequireBearerCallers_EmptyMapPassesThrough(t *testing.T) {
+	h := RequireBearerCallers(nil, "", http.HandlerFunc(ok))
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("empty map should pass, got %d", w.Result().StatusCode)
+	}
+}
+
+func TestCallerFromContext_DefaultEmpty(t *testing.T) {
+	if got := CallerFromContext(httptest.NewRequest(http.MethodGet, "/", nil).Context()); got != "" {
+		t.Errorf("default caller should be empty, got %q", got)
+	}
+}
+
 func TestRequireBearer_DefaultRealm(t *testing.T) {
 	h := RequireBearer("secret", "", http.HandlerFunc(ok))
 	r := httptest.NewRequest(http.MethodGet, "/", nil)

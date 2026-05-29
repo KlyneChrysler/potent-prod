@@ -75,6 +75,35 @@ tools:
 	}
 }
 
+func TestLoad_ParsesRateLimitAndAllowedCallers(t *testing.T) {
+	yaml := `
+tools:
+  send_email:
+    mode: strict
+    ttl: 24h
+    rate_limit:
+      rps: 10
+      burst: 5
+    allowed_callers: [team-eng, team-finance]
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	send := cfg.For("send_email")
+	if send.RateLimit.RPS != 10 || send.RateLimit.Burst != 5 {
+		t.Errorf("rate_limit = %+v, want {10, 5}", send.RateLimit)
+	}
+	if len(send.AllowedCallers) != 2 || send.AllowedCallers[0] != "team-eng" {
+		t.Errorf("allowed_callers = %v", send.AllowedCallers)
+	}
+}
+
 func TestParseDuration_Extensions(t *testing.T) {
 	tests := []struct {
 		in   string

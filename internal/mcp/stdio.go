@@ -165,7 +165,9 @@ func (h *StdioHandler) pumpClientToChild(ctx context.Context, in io.Reader, chil
 			continue
 		}
 
-		res, _, err := h.pipeline.Lookup(ctx, tool, args)
+		// mcp-stdio is single-tenant (the client shares this process), so
+		// no caller-id is plumbed through; ACLs are an http-only feature.
+		res, _, err := h.pipeline.Lookup(ctx, tool, "", args)
 		if err != nil {
 			h.logger.Warn("pipeline lookup", "err", err)
 			h.writeLine(childIn, copyLine)

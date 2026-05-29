@@ -164,6 +164,8 @@ func applyScalarOrOpenBlock(cfg *Config, stack *[]stackFrame, trim string, inden
 		tp.RequireHumanConfirmOnReplay = strings.TrimSpace(val) == "true"
 	case "fingerprint_fields":
 		tp.FingerprintFields = parseInlineList(val)
+	case "allowed_callers":
+		tp.AllowedCallers = parseInlineList(val)
 	default:
 		return fmt.Errorf("unknown key %q", key)
 	}

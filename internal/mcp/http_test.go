@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -285,6 +286,72 @@ func TestMCPHTTP_UpstreamErrorSurfaces(t *testing.T) {
 		// either OK with empty body or error — we only require the handler doesn't panic
 		body, _ := io.ReadAll(resp.Body)
 		_ = body
+	}
+}
+
+func TestMCPHTTP_PerToolACL_RejectsForbiddenCaller(t *testing.T) {
+	var calls int32
+	upstream := mcpUpstream(t, &calls, map[string]any{"jsonrpc": "2.0", "id": 1, "result": map[string]any{"ok": true}})
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			AllowedCallers:    []string{"team-eng"},
+		},
+	}}
+	u, _ := url.Parse(upstream.URL)
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewHTTPHandler(pl, u, nil, WithHTTPAPITokensFile(map[string]string{
+		"tok-mkt": "team-marketing",
+	})).Handler()
+
+	frame := map[string]any{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]any{"name": "send_email", "arguments": map[string]any{"to": "a@b.com"}},
+	}
+	b, _ := json.Marshal(frame)
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(b))
+	r.Header.Set("Authorization", "Bearer tok-mkt")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	body, _ := io.ReadAll(w.Result().Body)
+	var got Message
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v\nraw: %s", err, body)
+	}
+	if got.Error == nil || got.Error.Code != -32003 {
+		t.Errorf("expected json-rpc -32003 forbidden, got %+v", got.Error)
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Errorf("upstream should not have been called when caller is forbidden")
+	}
+}
+
+func TestMCPHTTP_WithHTTPUpstreamTLS_DoesNotPanicOnNil(t *testing.T) {
+	pl := pipeline.New(&policy.Config{}, store.NewMemory(nil))
+	u, _ := url.Parse("http://upstream.invalid")
+	h := NewHTTPHandler(pl, u, nil, WithHTTPUpstreamTLS(nil))
+	if h.client == nil {
+		t.Errorf("client should not be nil after WithHTTPUpstreamTLS(nil)")
+	}
+}
+
+func TestMCPHTTP_WithHTTPUpstreamTLS_ReplacesClientTransport(t *testing.T) {
+	pl := pipeline.New(&policy.Config{}, store.NewMemory(nil))
+	u, _ := url.Parse("http://upstream.invalid")
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: "wiring-test"}
+	h := NewHTTPHandler(pl, u, nil, WithHTTPUpstreamTLS(cfg))
+	tp, ok := h.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", h.client.Transport)
+	}
+	// Verify wiring via a distinctive non-default field. We do not exercise
+	// disabled verification anywhere, even in tests, to avoid modeling a
+	// real anti-pattern.
+	if tp.TLSClientConfig == nil || tp.TLSClientConfig.ServerName != "wiring-test" || tp.TLSClientConfig.MinVersion != tls.VersionTLS13 {
+		t.Errorf("tls config not applied to client transport: %+v", tp.TLSClientConfig)
 	}
 }
 
