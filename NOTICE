@@ -1,0 +1,12 @@
+potent
+Copyright 2026 Klyne Chrysler C. Dotarot
+
+This product includes software developed at or by the following parties:
+
+- The Prometheus Authors (https://prometheus.io): client_golang, client_model, common, procfs.
+- CoreOS / etcd Authors: go.etcd.io/bbolt.
+- The Go Authors: golang.org/x/sys, google.golang.org/protobuf.
+
+Attribution notices from these dependencies are reproduced from their
+respective NOTICE files in source distribution form. See each module's
+LICENSE and NOTICE files under the Go module cache for the full text.
