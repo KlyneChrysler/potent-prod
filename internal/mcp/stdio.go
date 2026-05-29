@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"sync"
+	"time"
 
 	"github.com/potent/potent/internal/pipeline"
 )
@@ -33,6 +34,12 @@ type StdioHandler struct {
 	cmdArgs  []string
 	logger   *slog.Logger
 
+	// requestTimeout bounds how long a forwarded tools/call may sit in the
+	// pending+inflight maps before being treated as failed. A hung or
+	// crashed child server otherwise leaks one map entry per orphaned
+	// request indefinitely.
+	requestTimeout time.Duration
+
 	mu       sync.Mutex
 	pending  map[string]pendingCall   // request id -> leader call
 	inflight map[string]*inflightCall // fingerprint hash -> in-flight forward
@@ -45,17 +52,23 @@ type StdioHandler struct {
 }
 
 type pendingCall struct {
-	tool string
-	args []byte
-	hash string
+	tool      string
+	args      []byte
+	hash      string
+	deadline  time.Time
 }
 
 // inflightCall coalesces concurrent duplicate tools/call requests. The leader
 // is the request that was actually forwarded to the child; waiters are
 // subsequent duplicates that arrived before the leader's response was cached.
 type inflightCall struct {
-	waiters []json.RawMessage // client request ids awaiting the leader's response
+	waiters  []json.RawMessage // client request ids awaiting the leader's response
+	deadline time.Time
 }
+
+// DefaultRequestTimeout is how long an in-flight tools/call may wait for a
+// response from the child before being garbage-collected.
+const DefaultRequestTimeout = 60 * time.Second
 
 // NewStdioHandler constructs a stdio MCP adapter that will exec the given
 // command as the upstream MCP server.
@@ -64,13 +77,20 @@ func NewStdioHandler(pl *pipeline.Pipeline, cmdPath string, cmdArgs []string, lo
 		logger = slog.Default()
 	}
 	return &StdioHandler{
-		pipeline: pl,
-		cmdPath:  cmdPath,
-		cmdArgs:  cmdArgs,
-		logger:   logger,
-		pending:  make(map[string]pendingCall),
-		inflight: make(map[string]*inflightCall),
+		pipeline:       pl,
+		cmdPath:        cmdPath,
+		cmdArgs:        cmdArgs,
+		logger:         logger,
+		requestTimeout: DefaultRequestTimeout,
+		pending:        make(map[string]pendingCall),
+		inflight:       make(map[string]*inflightCall),
 	}
+}
+
+// SetRequestTimeout overrides the default in-flight request timeout. Pass 0
+// to disable expiry (not recommended in production).
+func (h *StdioHandler) SetRequestTimeout(d time.Duration) {
+	h.requestTimeout = d
 }
 
 // Run starts the child and pumps frames until ctx is cancelled or either
@@ -91,6 +111,9 @@ func (h *StdioHandler) Run(ctx context.Context, clientIn io.Reader, clientOut io
 		return fmt.Errorf("start child: %w", err)
 	}
 
+	sweepCtx, stopSweep := context.WithCancel(ctx)
+	defer stopSweep()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -107,7 +130,14 @@ func (h *StdioHandler) Run(ctx context.Context, clientIn io.Reader, clientOut io
 		h.pumpChildToClient(childOut, clientOut)
 	}()
 
+	// background sweeper expires forgotten requests so a hung or crashed
+	// child server doesn't leak map entries forever.
+	if h.requestTimeout > 0 {
+		go h.sweepExpired(sweepCtx, clientOut)
+	}
+
 	wg.Wait()
+	stopSweep()
 	return cmd.Wait()
 }
 
@@ -152,6 +182,10 @@ func (h *StdioHandler) pumpClientToChild(ctx context.Context, in io.Reader, chil
 			out, _ := json.Marshal(blocked)
 			h.writeClient(clientOut, out)
 		default:
+			deadline := time.Time{}
+			if h.requestTimeout > 0 {
+				deadline = time.Now().Add(h.requestTimeout)
+			}
 			h.mu.Lock()
 			if ifc, ok := h.inflight[res.Hash]; ok {
 				// a sibling forward is already in flight; queue as a waiter
@@ -162,8 +196,8 @@ func (h *StdioHandler) pumpClientToChild(ctx context.Context, in io.Reader, chil
 				h.logger.Info("stdio coalesce", "tool", tool, "hash", res.Hash)
 				continue
 			}
-			h.pending[string(msg.ID)] = pendingCall{tool: tool, args: args, hash: res.Hash}
-			h.inflight[res.Hash] = &inflightCall{}
+			h.pending[string(msg.ID)] = pendingCall{tool: tool, args: args, hash: res.Hash, deadline: deadline}
+			h.inflight[res.Hash] = &inflightCall{deadline: deadline}
 			h.mu.Unlock()
 			h.writeLine(childIn, copyLine)
 		}
@@ -223,6 +257,63 @@ func (h *StdioHandler) maybeCacheResponse(msg *Message, raw []byte) []json.RawMe
 		h.logger.Info("stdio fan-out", "tool", call.tool, "waiters", len(ifc.waiters))
 	}
 	return ifc.waiters
+}
+
+// sweepExpired periodically scans the pending and inflight maps for entries
+// past their deadline, releases them, and notifies any waiting clients
+// with a JSON-RPC error so they don't hang forever.
+func (h *StdioHandler) sweepExpired(ctx context.Context, clientOut io.Writer) {
+	interval := h.requestTimeout / 4
+	if interval < 5*time.Second {
+		interval = 5 * time.Second
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-tick.C:
+			h.expireAt(now, clientOut)
+		}
+	}
+}
+
+// expireAt removes entries with deadlines in the past, emits timeout errors
+// to waiters, and returns the number of expirations (useful for metrics).
+func (h *StdioHandler) expireAt(now time.Time, clientOut io.Writer) int {
+	type expired struct {
+		ids []json.RawMessage // leader id + waiter ids that need a timeout error
+	}
+	var toNotify []expired
+
+	h.mu.Lock()
+	for id, call := range h.pending {
+		if !call.deadline.IsZero() && now.After(call.deadline) {
+			ids := []json.RawMessage{json.RawMessage(id)}
+			if ifc, ok := h.inflight[call.hash]; ok {
+				ids = append(ids, ifc.waiters...)
+				delete(h.inflight, call.hash)
+			}
+			delete(h.pending, id)
+			toNotify = append(toNotify, expired{ids: ids})
+		}
+	}
+	h.mu.Unlock()
+
+	count := 0
+	for _, e := range toNotify {
+		for _, id := range e.ids {
+			resp := NewErrorResponse(id, -32000, "upstream timeout")
+			out, _ := json.Marshal(resp)
+			h.writeClient(clientOut, out)
+			count++
+		}
+	}
+	if count > 0 {
+		h.logger.Warn("stdio sweep expired", "responses_sent", count)
+	}
+	return count
 }
 
 // writeLine writes a single JSON-RPC frame plus terminating newline as one
