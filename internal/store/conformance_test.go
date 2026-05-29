@@ -289,3 +289,87 @@ func TestBolt_OpenInvalidPath(t *testing.T) {
 		t.Errorf("expected error for invalid path")
 	}
 }
+
+func TestBolt_CompactRemovesExpiredEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compact.db")
+	now := time.Unix(1_700_000_000, 0)
+	clock := now
+	b, err := OpenBolt(path, func() time.Time { return clock })
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer b.Close()
+	ctx := context.Background()
+
+	// seed 5 entries; 3 expire in 1 minute, 2 live for an hour
+	for i := 0; i < 3; i++ {
+		_ = b.Put(ctx, Entry{Tool: "t", Hash: string(rune('a' + i)), TTL: time.Minute, CreatedAt: now})
+	}
+	_ = b.Put(ctx, Entry{Tool: "t", Hash: "live1", TTL: time.Hour, CreatedAt: now})
+	_ = b.Put(ctx, Entry{Tool: "t", Hash: "live2", TTL: time.Hour, CreatedAt: now})
+
+	clock = now.Add(2 * time.Minute)
+	removed, err := b.Compact(ctx)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if removed != 3 {
+		t.Errorf("removed = %d, want 3", removed)
+	}
+
+	// the two live entries must still be there
+	for _, h := range []string{"live1", "live2"} {
+		if _, err := b.Get(ctx, "t", h); err != nil {
+			t.Errorf("live entry %q gone after Compact: %v", h, err)
+		}
+	}
+	// expired ones must be gone
+	for i := 0; i < 3; i++ {
+		if _, err := b.Get(ctx, "t", string(rune('a'+i))); !errors.Is(err, ErrNotFound) {
+			t.Errorf("expired entry should be deleted, got %v", err)
+		}
+	}
+}
+
+func TestBolt_CompactIsNoOpWhenNothingExpired(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Unix(1_700_000_000, 0)
+	b, _ := OpenBolt(filepath.Join(dir, "no_op.db"), func() time.Time { return now })
+	defer b.Close()
+	ctx := context.Background()
+
+	_ = b.Put(ctx, Entry{Tool: "t", Hash: "x", TTL: time.Hour, CreatedAt: now})
+
+	removed, err := b.Compact(ctx)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("expected 0 removals, got %d", removed)
+	}
+}
+
+func TestBolt_RunCompactorRespectsContext(t *testing.T) {
+	dir := t.TempDir()
+	b, _ := OpenBolt(filepath.Join(dir, "ticker.db"), nil)
+	defer b.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	called := make(chan struct{}, 4)
+	go b.RunCompactor(ctx, 10*time.Millisecond, func(int, error) {
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+	})
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatalf("compactor never ran")
+	}
+	cancel()
+	// give the goroutine a moment to exit cleanly
+	time.Sleep(30 * time.Millisecond)
+}

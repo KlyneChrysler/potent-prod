@@ -66,6 +66,7 @@ func run() error {
 	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled; recommend 127.0.0.1:9095)")
 	maxBodyBytes := flag.Int64("max-body-bytes", 1<<20, "cap on inbound tool-call request bodies (0 = unlimited; recommend leaving the default)")
 	stdioTimeout := flag.Duration("stdio-request-timeout", 60*time.Second, "how long an in-flight mcp-stdio tools/call may wait for a response before being treated as failed")
+	compactInterval := flag.Duration("bolt-compact-interval", time.Hour, "how often the bolt store sweeps expired entries from disk (0 = disabled)")
 	flag.Parse()
 
 	adminToken := os.Getenv("POTENT_ADMIN_TOKEN")
@@ -90,6 +91,22 @@ func run() error {
 		return err
 	}
 	defer closeStore()
+
+	// Start the bolt compactor in a background goroutine so on-disk entries
+	// past their TTL are reclaimed even when never accessed via Get.
+	if b, ok := st.(*store.Bolt); ok && *compactInterval > 0 {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		go b.RunCompactor(ctx, *compactInterval, func(removed int, cerr error) {
+			if cerr != nil {
+				logger.Warn("bolt compactor", "err", cerr)
+				return
+			}
+			if removed > 0 {
+				logger.Info("bolt compact", "removed", removed)
+			}
+		})
+	}
 
 	emb, err := embed.NewHashingTFIDF(*embedDim, *embedN)
 	if err != nil {
