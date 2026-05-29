@@ -51,8 +51,10 @@ Pure-function packages (`normalizer`, `fingerprint`, `policy`) are written test-
 ## Git workflow
 
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`
+- **All commit messages and PR titles/bodies must be lowercase.** No capital letters anywhere in commit subjects, commit bodies, PR titles, or PR descriptions. Code identifiers, file paths, and proper nouns inside backticks stay as written.
+- **No em dashes (`—`) or en dashes (`–`) in any commit message or PR text.** Use a period, comma, parentheses, or rewrite the sentence. Regular hyphens (`-`) are fine.
 - Feature branches: `klyne/<short-desc>`
-- PR template: Goal / Summary / Design decisions / Edge cases / Test plan
+- PR template: goal / summary / design decisions / edge cases / test plan
 - Commits attributed to Klyne only. No Co-Authored-By.
 
 ## Operational
