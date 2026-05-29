@@ -235,7 +235,7 @@ func (p *Pipeline) Lookup(ctx context.Context, tool, caller string, body []byte)
 			Match:      match,
 			Hash:       entry.Hash,
 			StatusCode: entry.StatusCode,
-			Body:       entry.Response,
+			Body:       renderReplayBody(tool, entry, pol),
 		}, intent, nil
 	case DecisionBlock:
 		return Result{Decision: DecisionBlock, Match: match, Hash: entry.Hash, StatusCode: 409}, intent, nil
@@ -266,16 +266,7 @@ func (p *Pipeline) Cache(ctx context.Context, tool string, body []byte, status i
 			emb = v
 		}
 	}
-	if err := p.store.Put(ctx, store.Entry{
-		Tool:       tool,
-		Hash:       hash,
-		Request:    body,
-		Response:   response,
-		StatusCode: status,
-		CreatedAt:  p.now(),
-		TTL:        pol.TTL,
-		Embedding:  emb,
-	}); err != nil {
+	if err := p.store.Put(ctx, p.buildEntry(tool, hash, body, status, response, pol, emb)); err != nil {
 		p.recordStoreError("put")
 		return fmt.Errorf("store put: %w", err)
 	}
@@ -338,7 +329,7 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 			Match:      match,
 			Hash:       entry.Hash,
 			StatusCode: entry.StatusCode,
-			Body:       entry.Response,
+			Body:       renderReplayBody(tool, entry, pol),
 		}, nil
 	case DecisionBlock:
 		return Result{Decision: DecisionBlock, Match: match, Hash: entry.Hash, StatusCode: 409}, nil
@@ -376,20 +367,49 @@ func (p *Pipeline) shadowForward(ctx context.Context, tool, hash, intent string,
 				emb = v
 			}
 		}
-		if perr := p.store.Put(ctx, store.Entry{
-			Tool:       tool,
-			Hash:       hash,
-			Request:    body,
-			Response:   resp,
-			StatusCode: status,
-			CreatedAt:  p.now(),
-			TTL:        pol.TTL,
-			Embedding:  emb,
-		}); perr != nil {
+		if perr := p.store.Put(ctx, p.buildEntry(tool, hash, body, status, resp, pol, emb)); perr != nil {
 			p.recordStoreError("put")
 		}
 	}
 	return Result{Decision: DecisionForward, Hash: hash, StatusCode: status, Body: resp}, nil
+}
+
+// buildEntry constructs the store.Entry to persist for a tool call. Two
+// PII-aware policy hooks may rewrite the entry:
+//
+//   - RedactRequestBody drops the raw inbound bytes (the fingerprint hash
+//     keeps the cache functional; only the admin debug view loses signal)
+//   - ReplayStrategy == synthesized_ack drops the upstream response bytes
+//     so a future replay returns the SynthesizedResponse template instead
+//     of byte-for-byte forwarding the original (possibly sensitive) body
+func (p *Pipeline) buildEntry(tool, hash string, body []byte, status int, resp []byte, pol policy.ToolPolicy, emb []float32) store.Entry {
+	e := store.Entry{
+		Tool:       tool,
+		Hash:       hash,
+		StatusCode: status,
+		CreatedAt:  p.now(),
+		TTL:        pol.TTL,
+		Embedding:  emb,
+	}
+	if !pol.RedactRequestBody {
+		e.Request = body
+	}
+	if pol.ReplayStrategy != policy.ReplaySynthesizedAck {
+		e.Response = resp
+	}
+	return e
+}
+
+// renderReplayBody decides what bytes to return on a cache hit. When the
+// stored entry has a response body, use it (the fast path; cached_response
+// strategy). When the response is empty (synthesized_ack strategy or
+// otherwise) render the configured template so a replay still returns
+// something parseable.
+func renderReplayBody(tool string, entry store.Entry, pol policy.ToolPolicy) []byte {
+	if len(entry.Response) > 0 {
+		return entry.Response
+	}
+	return pol.SynthesizeReplay(tool, entry.Hash)
 }
 
 // runLeader runs doForward with panic recovery. A panic in the forward
@@ -476,17 +496,7 @@ func (p *Pipeline) doForward(ctx context.Context, tool, hash, intent string, pol
 				emb = v
 			}
 		}
-		perr := p.store.Put(ctx, store.Entry{
-			Tool:       tool,
-			Hash:       hash,
-			Request:    body,
-			Response:   resp,
-			StatusCode: status,
-			CreatedAt:  p.now(),
-			TTL:        pol.TTL,
-			Embedding:  emb,
-		})
-		if perr != nil {
+		if perr := p.store.Put(ctx, p.buildEntry(tool, hash, body, status, resp, pol, emb)); perr != nil {
 			p.recordStoreError("put")
 		}
 	}

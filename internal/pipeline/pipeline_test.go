@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -512,6 +513,105 @@ func hashFor(t *testing.T, body string) string {
 		t.Fatalf("analyse: %v", err)
 	}
 	return h
+}
+
+func TestApply_SynthesizedAck_NeverStoresResponseBody(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"charge_card": {
+			Mode:                policy.ModeStrict,
+			TTL:                 time.Hour,
+			FingerprintFields:   []string{"customer_id", "amount_cents"},
+			ReplayStrategy:      policy.ReplaySynthesizedAck,
+			SynthesizedResponse: `{"already_charged":true,"hash":"$hash"}`,
+		},
+	}}
+	st := store.NewMemory(nil)
+	pl := New(cfg, st)
+
+	upstreamCalls := 0
+	forward := func(ctx context.Context) (int, []byte, error) {
+		upstreamCalls++
+		// real upstream returns a sensitive body: card processor's auth code
+		return 200, []byte(`{"auth_code":"AUTH-SECRET-789","charged":true}`), nil
+	}
+
+	body := []byte(`{"customer_id":"cus_acme","amount_cents":10000}`)
+
+	// First call: forwards, upstream's response goes back to caller, but
+	// the cache must NOT store the sensitive body.
+	r1, err := pl.Apply(context.Background(), "charge_card", "", body, forward)
+	if err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if !bytes.Contains(r1.Body, []byte("AUTH-SECRET-789")) {
+		t.Errorf("first call should pass upstream body through to the caller")
+	}
+
+	// Inspect the entry: response field must be empty.
+	pol := cfg.For("charge_card")
+	hash, _, _ := analyse(body, pol)
+	stored, err := st.Get(context.Background(), "charge_card", hash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(stored.Response) != 0 {
+		t.Errorf("synthesized_ack should drop response; got %d bytes stored", len(stored.Response))
+	}
+
+	// Second identical call: replays, returns the synthesized template.
+	r2, err := pl.Apply(context.Background(), "charge_card", "", body, forward)
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if r2.Decision != DecisionReplay {
+		t.Errorf("second call should replay, got %v", r2.Decision)
+	}
+	if bytes.Contains(r2.Body, []byte("AUTH-SECRET-789")) {
+		t.Errorf("replay leaked the sensitive upstream body: %s", r2.Body)
+	}
+	if !bytes.Contains(r2.Body, []byte(`"already_charged":true`)) {
+		t.Errorf("replay did not render synthesized template: %s", r2.Body)
+	}
+	if !bytes.Contains(r2.Body, []byte(hash)) {
+		t.Errorf("replay did not expand $hash token: %s", r2.Body)
+	}
+	if upstreamCalls != 1 {
+		t.Errorf("upstream called %d times, want 1", upstreamCalls)
+	}
+}
+
+func TestApply_RedactRequestBody_StoresNilRequestBytes(t *testing.T) {
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {
+			Mode:              policy.ModeStrict,
+			TTL:               time.Hour,
+			FingerprintFields: []string{"to"},
+			RedactRequestBody: true,
+		},
+	}}
+	st := store.NewMemory(nil)
+	pl := New(cfg, st)
+	forward := func(ctx context.Context) (int, []byte, error) { return 200, []byte(`{"ok":true}`), nil }
+
+	body := []byte(`{"to":"alice@example.com","ssn":"123-45-6789"}`)
+	if _, err := pl.Apply(context.Background(), "send_email", "", body, forward); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	pol := cfg.For("send_email")
+	hash, _, _ := analyse(body, pol)
+	stored, err := st.Get(context.Background(), "send_email", hash)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(stored.Request) != 0 {
+		t.Errorf("redact_request_body should drop request bytes; got %d bytes stored", len(stored.Request))
+	}
+	// Fingerprint still works for the cache to dedupe.
+	r, _ := pl.Apply(context.Background(), "send_email", "", body, forward)
+	if r.Decision != DecisionReplay {
+		t.Errorf("dedupe still works after redaction; got %v", r.Decision)
+	}
 }
 
 func TestApply_RateLimitReturns429WhenExceeded(t *testing.T) {

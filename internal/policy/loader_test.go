@@ -75,6 +75,48 @@ tools:
 	}
 }
 
+func TestLoad_ParsesReplayStrategyAndRedaction(t *testing.T) {
+	yaml := `
+tools:
+  charge_card:
+    mode: strict
+    ttl: 7d
+    replay_strategy: synthesized_ack
+    synthesized_response: '{"already_charged":true,"hash":"$hash"}'
+    redact_request_body: true
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	pol := cfg.For("charge_card")
+	if pol.ReplayStrategy != ReplaySynthesizedAck {
+		t.Errorf("replay_strategy = %q", pol.ReplayStrategy)
+	}
+	if pol.SynthesizedResponse != `{"already_charged":true,"hash":"$hash"}` {
+		t.Errorf("synthesized_response = %q", pol.SynthesizedResponse)
+	}
+	if !pol.RedactRequestBody {
+		t.Errorf("redact_request_body should be true")
+	}
+}
+
+func TestLoad_RejectsUnknownReplayStrategy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "p.yaml")
+	if err := os.WriteFile(path, []byte("tools:\n  x:\n    mode: strict\n    replay_strategy: bogus\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Errorf("expected error for unknown replay_strategy")
+	}
+}
+
 func TestLoad_ParsesRateLimitAndAllowedCallers(t *testing.T) {
 	yaml := `
 tools:

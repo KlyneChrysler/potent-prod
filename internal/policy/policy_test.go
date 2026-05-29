@@ -80,6 +80,31 @@ func TestToolPolicy_AllowsCaller(t *testing.T) {
 	}
 }
 
+func TestToolPolicy_SynthesizeReplay(t *testing.T) {
+	cases := []struct {
+		name string
+		tmpl string
+		tool string
+		hash string
+		want string
+	}{
+		{"empty template uses default", "", "send_email", "abc123", `{"replayed":true,"hash":"abc123"}`},
+		{"hash expansion", `{"id":"$hash"}`, "send_email", "deadbeef", `{"id":"deadbeef"}`},
+		{"tool expansion", `{"tool":"$tool","hash":"$hash"}`, "charge_card", "h1", `{"tool":"charge_card","hash":"h1"}`},
+		{"no expansion tokens", `{"static":true}`, "x", "y", `{"static":true}`},
+		{"lone dollar sign untouched", `{"price":"$10"}`, "x", "y", `{"price":"$10"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := ToolPolicy{SynthesizedResponse: c.tmpl}
+			got := string(p.SynthesizeReplay(c.tool, c.hash))
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestModes_StringValues(t *testing.T) {
 	tests := []struct {
 		mode Mode
