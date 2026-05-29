@@ -55,6 +55,12 @@ type Proxy struct {
 	// so the connection to upstream uses a custom CA pool, client cert,
 	// or insecure-skip-verify per operator policy.
 	upstreamTLS *tls.Config
+
+	// oidcVerifier, when non-nil, validates inbound bearer tokens as
+	// IdP-signed JWTs and extracts the caller-id from the configured
+	// claim. Takes precedence over the static apiTokens map and the
+	// single apiToken when set.
+	oidcVerifier auth.TokenVerifier
 }
 
 // Option configures a Proxy at construction time.
@@ -85,6 +91,12 @@ func WithAPITokensFile(tokens map[string]string) Option {
 // from cfg. Pass nil for the default (system trust store, no client cert).
 func WithUpstreamTLS(cfg *tls.Config) Option {
 	return func(p *Proxy) { p.upstreamTLS = cfg }
+}
+
+// WithOIDCVerifier installs a JWKS-backed JWT verifier. When set, takes
+// precedence over the static apiTokens / apiToken paths.
+func WithOIDCVerifier(v auth.TokenVerifier) Option {
+	return func(p *Proxy) { p.oidcVerifier = v }
 }
 
 // New constructs an HTTP-mode proxy.
@@ -130,9 +142,12 @@ func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...
 // precedence over single-token (apiToken).
 func (p *Proxy) Handler() http.Handler {
 	var inner http.Handler = p
-	if len(p.apiTokens) > 0 {
+	switch {
+	case p.oidcVerifier != nil:
+		inner = auth.RequireBearerVerifier(p.oidcVerifier, "potent", inner)
+	case len(p.apiTokens) > 0:
 		inner = auth.RequireBearerCallers(p.apiTokens, "potent", inner)
-	} else {
+	default:
 		inner = auth.RequireBearer(p.apiToken, "potent", inner)
 	}
 	return tracing.Middleware(inner)

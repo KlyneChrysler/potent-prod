@@ -58,6 +58,50 @@ func RequireBearer(token, realm string, next http.Handler) http.Handler {
 	})
 }
 
+// TokenVerifier validates an opaque bearer token and returns the
+// caller-id it represents. RequireBearerVerifier delegates the actual
+// validation here so OIDC, static tokens, and future schemes can share
+// the same middleware shape.
+type TokenVerifier interface {
+	Verify(token string) (callerID string, err error)
+}
+
+// RequireBearerVerifier returns an http.Handler that gates next behind a
+// TokenVerifier. On success the verified caller-id is stored in the
+// request context for downstream ACL enforcement. A nil verifier
+// disables auth.
+func RequireBearerVerifier(v TokenVerifier, realm string, next http.Handler) http.Handler {
+	if v == nil {
+		return next
+	}
+	if realm == "" {
+		realm = "potent"
+	}
+	challenge := `Bearer realm="` + realm + `"`
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !startsWith(header, prefix) {
+			w.Header().Set("WWW-Authenticate", challenge)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		caller, err := v.Verify(header[len(prefix):])
+		if err != nil || caller == "" {
+			w.Header().Set("WWW-Authenticate", challenge)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), callerKey{}, caller)))
+	})
+}
+
+// startsWith is a tiny strings.HasPrefix replacement that avoids the
+// import in this file.
+func startsWith(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
 // RequireBearerCallers returns an http.Handler that validates the inbound
 // Authorization: Bearer header against tokens, a {token -> caller-id} map.
 // On success, the matching caller-id is stored in the request context so

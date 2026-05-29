@@ -104,6 +104,78 @@ func TestRequireBearerCallers_EmptyMapPassesThrough(t *testing.T) {
 	}
 }
 
+// fakeVerifier is a stand-in for an OIDC token verifier; returns the
+// stubbed callerID on the configured token, error on anything else.
+type fakeVerifier struct {
+	wantToken string
+	callerID  string
+	err       error
+}
+
+func (f fakeVerifier) Verify(token string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	if token != f.wantToken {
+		return "", http.ErrAbortHandler // any non-nil
+	}
+	return f.callerID, nil
+}
+
+func TestRequireBearerVerifier_AcceptsValidTokenAndAttachesCaller(t *testing.T) {
+	var seen string
+	h := RequireBearerVerifier(
+		fakeVerifier{wantToken: "good-token", callerID: "team-eng"},
+		"",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen = CallerFromContext(r.Context())
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer good-token")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", w.Result().StatusCode)
+	}
+	if seen != "team-eng" {
+		t.Errorf("caller in ctx = %q, want team-eng", seen)
+	}
+}
+
+func TestRequireBearerVerifier_RejectsMissingBearerPrefix(t *testing.T) {
+	h := RequireBearerVerifier(fakeVerifier{wantToken: "x", callerID: "y"}, "", http.HandlerFunc(ok))
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Result().StatusCode)
+	}
+}
+
+func TestRequireBearerVerifier_RejectsVerifyError(t *testing.T) {
+	h := RequireBearerVerifier(fakeVerifier{err: http.ErrAbortHandler}, "", http.HandlerFunc(ok))
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Authorization", "Bearer anything")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", w.Result().StatusCode)
+	}
+}
+
+func TestRequireBearerVerifier_NilVerifierPassesThrough(t *testing.T) {
+	h := RequireBearerVerifier(nil, "", http.HandlerFunc(ok))
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Result().StatusCode != http.StatusOK {
+		t.Errorf("nil verifier should pass through, got %d", w.Result().StatusCode)
+	}
+}
+
 func TestCallerFromContext_DefaultEmpty(t *testing.T) {
 	if got := CallerFromContext(httptest.NewRequest(http.MethodGet, "/", nil).Context()); got != "" {
 		t.Errorf("default caller should be empty, got %q", got)

@@ -3,6 +3,7 @@ module github.com/potent/potent
 go 1.23.0
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/prometheus/client_golang v1.23.2
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/time v0.5.0

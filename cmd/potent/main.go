@@ -27,9 +27,11 @@ import (
 
 	"github.com/potent/potent/internal/admin"
 	"github.com/potent/potent/internal/audit"
+	"github.com/potent/potent/internal/auth"
 	"github.com/potent/potent/internal/embed"
 	"github.com/potent/potent/internal/mcp"
 	"github.com/potent/potent/internal/metrics"
+	"github.com/potent/potent/internal/oidc"
 	"github.com/potent/potent/internal/pipeline"
 	"github.com/potent/potent/internal/policy"
 	"github.com/potent/potent/internal/proxy"
@@ -76,6 +78,11 @@ func run() error {
 	upstreamKey := flag.String("upstream-key", "", "PEM file with client private key for mTLS to upstream")
 	upstreamSkipVerify := flag.Bool("upstream-insecure-skip-verify", false, "skip upstream TLS verification (testing only; never enable in production)")
 	shadowMode := flag.Bool("shadow-mode", false, "observe-only: every call is forwarded and audit log records the would-be decision; useful for calibrating semantic_threshold and ACLs against real traffic before flipping the policy on")
+	oidcJWKS := flag.String("oidc-jwks-url", "", "OIDC IdP JWKS endpoint; when set, inbound bearer tokens are validated as JWTs signed by the IdP and the caller-id is taken from the configured claim")
+	oidcIssuer := flag.String("oidc-issuer", "", "required JWT iss claim (recommended in production)")
+	oidcAudience := flag.String("oidc-audience", "", "required JWT aud claim")
+	oidcCallerClaim := flag.String("oidc-caller-claim", "sub", "JWT claim used as caller-id for ACLs and audit")
+	oidcRefreshInterval := flag.Duration("oidc-refresh-interval", time.Hour, "how often the JWKS cache is re-fetched")
 	flag.Parse()
 
 	apiToken := os.Getenv("POTENT_API_TOKEN")
@@ -178,8 +185,28 @@ func run() error {
 	// Refuse to start an unauthenticated proxy listener on a non-loopback
 	// address. mcp-stdio is single-tenant (the client and child share the
 	// parent process) so the check does not apply.
-	if (*mode == "http" || *mode == "mcp-http") && apiToken == "" && len(apiTokens) == 0 && !isLoopbackBind(*addr) {
-		return fmt.Errorf("refusing to expose unauthenticated proxy on %q; set POTENT_API_TOKEN, supply -api-tokens-file, or bind -addr to loopback", *addr)
+	if (*mode == "http" || *mode == "mcp-http") && apiToken == "" && len(apiTokens) == 0 && *oidcJWKS == "" && !isLoopbackBind(*addr) {
+		return fmt.Errorf("refusing to expose unauthenticated proxy on %q; set POTENT_API_TOKEN, supply -api-tokens-file, set -oidc-jwks-url, or bind -addr to loopback", *addr)
+	}
+
+	// Construct the OIDC verifier and start its refresh loop when configured.
+	var oidcVerifier *oidc.Verifier
+	if *oidcJWKS != "" {
+		v, verr := oidc.NewVerifier(oidc.Config{
+			JWKSURL:         *oidcJWKS,
+			Issuer:          *oidcIssuer,
+			Audience:        *oidcAudience,
+			CallerClaim:     *oidcCallerClaim,
+			RefreshInterval: *oidcRefreshInterval,
+			Logger:          logger,
+		})
+		if verr != nil {
+			return fmt.Errorf("oidc verifier: %w", verr)
+		}
+		oidcVerifier = v
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		go func() { _ = oidcVerifier.Run(ctx) }()
+		defer cancel()
 	}
 
 	tlsCfg, err := buildUpstreamTLS(*upstreamCA, *upstreamCert, *upstreamKey, *upstreamSkipVerify, logger)
@@ -187,11 +214,16 @@ func run() error {
 		return fmt.Errorf("upstream tls: %w", err)
 	}
 
+	var oidcAuth auth.TokenVerifier
+	if oidcVerifier != nil {
+		oidcAuth = oidcVerifier
+	}
+
 	switch *mode {
 	case "http":
-		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken, apiTokens, tlsCfg)
+		return runHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken, apiTokens, tlsCfg, oidcAuth)
 	case "mcp-http":
-		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken, apiTokens, tlsCfg)
+		return runMCPHTTP(*addr, *metricsAddr, *upstream, pl, m, logger, *maxBodyBytes, apiToken, apiTokens, tlsCfg, oidcAuth)
 	case "mcp-stdio":
 		return runMCPStdio(*upstream, pl, logger, *stdioTimeout)
 	default:
@@ -199,17 +231,23 @@ func run() error {
 	}
 }
 
-func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string, apiTokens map[string]string, tlsCfg *tls.Config) error {
+func runHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string, apiTokens map[string]string, tlsCfg *tls.Config, oidcAuth auth.TokenVerifier) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
 	}
-	opts := []proxy.Option{proxy.WithMaxBodyBytes(maxBody), proxy.WithAPIToken(apiToken), proxy.WithAPITokensFile(apiTokens), proxy.WithUpstreamTLS(tlsCfg)}
+	opts := []proxy.Option{
+		proxy.WithMaxBodyBytes(maxBody),
+		proxy.WithAPIToken(apiToken),
+		proxy.WithAPITokensFile(apiTokens),
+		proxy.WithUpstreamTLS(tlsCfg),
+		proxy.WithOIDCVerifier(oidcAuth),
+	}
 	p := proxy.New(pl, u, logger, opts...)
 	return serveDual(addr, metricsAddr, p.Handler(), m, "http", upstream, logger)
 }
 
-func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string, apiTokens map[string]string, tlsCfg *tls.Config) error {
+func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *metrics.Metrics, logger *slog.Logger, maxBody int64, apiToken string, apiTokens map[string]string, tlsCfg *tls.Config, oidcAuth auth.TokenVerifier) error {
 	u, err := url.Parse(upstream)
 	if err != nil {
 		return err
@@ -219,6 +257,7 @@ func runMCPHTTP(addr, metricsAddr, upstream string, pl *pipeline.Pipeline, m *me
 		mcp.WithHTTPAPIToken(apiToken),
 		mcp.WithHTTPAPITokensFile(apiTokens),
 		mcp.WithHTTPUpstreamTLS(tlsCfg),
+		mcp.WithHTTPOIDCVerifier(oidcAuth),
 	)
 	return serveDual(addr, metricsAddr, h.Handler(), m, "mcp-http", upstream, logger)
 }
