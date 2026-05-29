@@ -14,28 +14,48 @@ import (
 	"github.com/potent/potent/internal/pipeline"
 )
 
+// DefaultMaxBodyBytes caps a single JSON-RPC frame body. MCP frames are
+// usually small; 1 MiB is well above realistic tools/call payloads and well
+// below memory-exhaustion territory.
+const DefaultMaxBodyBytes int64 = 1 << 20
+
 // HTTPHandler is an MCP Streamable HTTP adapter. It accepts JSON-RPC frames
 // over POST, intercepts tools/call to run them through the pipeline, and
 // passes everything else (initialize, tools/list, resources/*, etc.)
 // untouched to the upstream MCP server.
 type HTTPHandler struct {
-	pipeline *pipeline.Pipeline
-	upstream *url.URL
-	client   *http.Client
-	logger   *slog.Logger
+	pipeline     *pipeline.Pipeline
+	upstream     *url.URL
+	client       *http.Client
+	logger       *slog.Logger
+	maxBodyBytes int64
+}
+
+// HTTPOption configures an HTTPHandler at construction time.
+type HTTPOption func(*HTTPHandler)
+
+// WithHTTPMaxBodyBytes caps the size of inbound JSON-RPC frames. Pass 0 to
+// disable the cap (not recommended).
+func WithHTTPMaxBodyBytes(n int64) HTTPOption {
+	return func(h *HTTPHandler) { h.maxBodyBytes = n }
 }
 
 // NewHTTPHandler constructs the MCP HTTP adapter.
-func NewHTTPHandler(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger) *HTTPHandler {
+func NewHTTPHandler(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...HTTPOption) *HTTPHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HTTPHandler{
-		pipeline: pl,
-		upstream: upstream,
-		client:   &http.Client{},
-		logger:   logger,
+	h := &HTTPHandler{
+		pipeline:     pl,
+		upstream:     upstream,
+		client:       &http.Client{},
+		logger:       logger,
+		maxBodyBytes: DefaultMaxBodyBytes,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // ServeHTTP implements http.Handler.
@@ -48,9 +68,13 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	reader := io.Reader(r.Body)
+	if h.maxBodyBytes > 0 {
+		reader = http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
+	}
+	body, err := io.ReadAll(reader)
 	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+		http.Error(w, "read body", http.StatusRequestEntityTooLarge)
 		return
 	}
 	_ = r.Body.Close()

@@ -203,6 +203,34 @@ func TestProxy_CacheModeReplays(t *testing.T) {
 	}
 }
 
+func TestProxy_RejectsOversizedBody(t *testing.T) {
+	var calls int32
+	upstream := makeUpstream(t, &calls, `{"ok":true}`)
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	u, _ := url.Parse(upstream.URL)
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	p := New(pl, u, nil, WithMaxBodyBytes(64)) // tiny cap for the test
+
+	huge := bytes.Repeat([]byte("a"), 256)
+	body := append([]byte(`{"to":"alice@example.com","filler":"`), huge...)
+	body = append(body, '"', '}')
+
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	r.Header.Set(ToolHeader, "send_email")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, r)
+
+	if w.Result().StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("expected 413, got %d", w.Result().StatusCode)
+	}
+	if atomic.LoadInt32(&calls) != 0 {
+		t.Errorf("upstream should not have been called for oversized body")
+	}
+}
+
 func TestProxy_SemanticReplay(t *testing.T) {
 	var calls int32
 	upstream := makeUpstream(t, &calls, `{"ok":true,"id":"msg-1"}`)

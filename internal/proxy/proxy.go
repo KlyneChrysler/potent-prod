@@ -23,26 +23,46 @@ import (
 // tool is being invoked.
 const ToolHeader = "X-Potent-Tool"
 
+// DefaultMaxBodyBytes caps a single tool-call request body. Tool call bodies
+// are arguments JSON; 1 MiB is well above realistic usage and well below
+// memory-exhaustion territory.
+const DefaultMaxBodyBytes int64 = 1 << 20
+
 // Proxy is an http.Handler that runs requests through the idempotency
 // pipeline before forwarding to upstream.
 type Proxy struct {
-	pipeline *pipeline.Pipeline
-	upstream *httputil.ReverseProxy
-	upstrURL *url.URL
-	logger   *slog.Logger
+	pipeline     *pipeline.Pipeline
+	upstream     *httputil.ReverseProxy
+	upstrURL     *url.URL
+	logger       *slog.Logger
+	maxBodyBytes int64
+}
+
+// Option configures a Proxy at construction time.
+type Option func(*Proxy)
+
+// WithMaxBodyBytes caps the size of inbound tool-call request bodies.
+// Pass 0 to disable the cap (not recommended).
+func WithMaxBodyBytes(n int64) Option {
+	return func(p *Proxy) { p.maxBodyBytes = n }
 }
 
 // New constructs an HTTP-mode proxy.
-func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger) *Proxy {
+func New(pl *pipeline.Pipeline, upstream *url.URL, logger *slog.Logger, opts ...Option) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Proxy{
-		pipeline: pl,
-		upstream: httputil.NewSingleHostReverseProxy(upstream),
-		upstrURL: upstream,
-		logger:   logger,
+	p := &Proxy{
+		pipeline:     pl,
+		upstream:     httputil.NewSingleHostReverseProxy(upstream),
+		upstrURL:     upstream,
+		logger:       logger,
+		maxBodyBytes: DefaultMaxBodyBytes,
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // ServeHTTP implements http.Handler.
@@ -53,9 +73,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	reader := io.Reader(r.Body)
+	if p.maxBodyBytes > 0 {
+		reader = http.MaxBytesReader(w, r.Body, p.maxBodyBytes)
+	}
+	body, err := io.ReadAll(reader)
 	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
+		http.Error(w, "read body", http.StatusRequestEntityTooLarge)
 		return
 	}
 	_ = r.Body.Close()

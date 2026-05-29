@@ -281,6 +281,68 @@ func TestStdio_CoalescesPipelinedDuplicates(t *testing.T) {
 	}
 }
 
+func TestStdio_ExpireAt_NotifiesWaiters(t *testing.T) {
+	// A leader plus two waiters whose deadlines have passed should each
+	// receive a JSON-RPC timeout error, and the maps should be cleared.
+
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"send_email": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"to"}},
+	}}
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewStdioHandler(pl, "/nonexistent", nil, nil)
+	h.SetRequestTimeout(50 * time.Millisecond)
+
+	pastDeadline := time.Now().Add(-time.Second)
+	h.pending["1"] = pendingCall{tool: "send_email", args: []byte(`{"to":"a"}`), hash: "h1", deadline: pastDeadline}
+	h.inflight["h1"] = &inflightCall{waiters: []json.RawMessage{json.RawMessage(`2`), json.RawMessage(`3`)}}
+
+	out := &bytes.Buffer{}
+	n := h.expireAt(time.Now(), out)
+	if n != 3 {
+		t.Errorf("expected 3 timeout responses, got %d", n)
+	}
+	if len(h.pending) != 0 {
+		t.Errorf("pending map not cleared: %v", h.pending)
+	}
+	if len(h.inflight) != 0 {
+		t.Errorf("inflight map not cleared: %v", h.inflight)
+	}
+
+	// must be 3 JSON-RPC error lines on the writer
+	lines := bytes.Split(bytes.TrimRight(out.Bytes(), "\n"), []byte("\n"))
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d:\n%s", len(lines), out.String())
+	}
+	for _, line := range lines {
+		var m Message
+		if err := json.Unmarshal(line, &m); err != nil {
+			t.Errorf("bad timeout frame: %v\nraw: %s", err, line)
+			continue
+		}
+		if m.Error == nil || m.Error.Code != -32000 {
+			t.Errorf("expected -32000 error, got %+v", m.Error)
+		}
+	}
+}
+
+func TestStdio_ExpireAt_LeavesUnexpiredAlone(t *testing.T) {
+	cfg := &policy.Config{}
+	pl := pipeline.New(cfg, store.NewMemory(nil))
+	h := NewStdioHandler(pl, "/nonexistent", nil, nil)
+
+	futureDeadline := time.Now().Add(time.Hour)
+	h.pending["1"] = pendingCall{tool: "t", args: []byte(`{}`), hash: "h", deadline: futureDeadline}
+	h.inflight["h"] = &inflightCall{}
+
+	n := h.expireAt(time.Now(), &bytes.Buffer{})
+	if n != 0 {
+		t.Errorf("nothing should expire, got %d", n)
+	}
+	if len(h.pending) != 1 || len(h.inflight) != 1 {
+		t.Errorf("unexpired entries were removed: pending=%d inflight=%d", len(h.pending), len(h.inflight))
+	}
+}
+
 func TestStdio_RunFailsOnBadCommand(t *testing.T) {
 	cfg := &policy.Config{}
 	pl := pipeline.New(cfg, store.NewMemory(nil))
