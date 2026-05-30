@@ -1,10 +1,11 @@
-// Package audit writes a structured record of every policy decision to a
-// JSONL stream. Operators wire this to a local file for compliance, ship
-// it to S3 / Loki / Splunk, or discard it entirely.
+// Package audit writes a structured record of every policy decision to one
+// or more sinks. Operators wire records to a local file for compliance,
+// ship them to object storage for long-term retention, or both at once.
 //
-// Records are buffered through a bounded channel and written by a single
-// background goroutine to keep request-path overhead at one channel send.
-// On graceful shutdown the writer drains the channel before returning.
+// The public surface is intentionally small: a Record schema, a Sink
+// interface, and a Writer that fans a record out to every configured sink.
+// Each sink owns its own buffering and shutdown semantics so the request
+// path applies one channel send per sink.
 package audit
 
 import (
@@ -45,27 +46,100 @@ type Record struct {
 	TraceID string `json:"trace_id,omitempty"`
 }
 
-// Writer accepts records on a buffered channel. Construct via Open or
-// NewDiscard; never instantiate directly.
+// Sink consumes audit records. Implementations own their own buffering,
+// flush cadence, and error reporting. Write must not block on slow I/O;
+// it should enqueue and return. Close must drain pending records and
+// return once they have been flushed or ctx expires.
+type Sink interface {
+	Write(Record) error
+	Close(ctx context.Context) error
+}
+
+// Writer fans a record out to every configured sink. Construct via
+// NewWriter, Open (convenience for a single file sink), or NewDiscard.
 type Writer struct {
-	ch     chan Record
-	wg     sync.WaitGroup
+	sinks  []Sink
 	closed chan struct{}
 	once   sync.Once
 	now    func() time.Time
 }
 
-// Open returns a Writer that appends JSON-encoded records to path, one per
-// line. The file is created with 0600 perms if absent; parent directories
-// must already exist. capacity sizes the internal channel — sends block
-// when full so the request path applies backpressure rather than losing
-// records.
+// NewWriter returns a Writer that dispatches each record to every sink in
+// order. A Writer with no sinks discards records.
+func NewWriter(sinks ...Sink) *Writer {
+	return &Writer{
+		sinks:  sinks,
+		closed: make(chan struct{}),
+		now:    time.Now,
+	}
+}
+
+// Open returns a Writer with a single file sink appending JSON-encoded
+// records to path. Kept for backwards compatibility with v0.1.0 .. v0.1.13.
 func Open(path string, capacity int) (*Writer, error) {
+	s, err := NewFileSink(path, capacity)
+	if err != nil {
+		return nil, err
+	}
+	return NewWriter(s), nil
+}
+
+// NewDiscard returns a Writer with no sinks. Useful for tests and
+// configurations where auditing is disabled but callers still want a
+// non-nil Writer to avoid nil checks.
+func NewDiscard() *Writer { return NewWriter() }
+
+// Write enqueues a record on every sink. Errors from sinks are not
+// propagated to the caller; sinks are responsible for their own error
+// reporting (typically via logs or metrics). After Close, Write is a
+// no-op.
+func (w *Writer) Write(r Record) {
+	select {
+	case <-w.closed:
+		return
+	default:
+	}
+	if r.Timestamp.IsZero() {
+		r.Timestamp = w.now()
+	}
+	for _, s := range w.sinks {
+		_ = s.Write(r)
+	}
+}
+
+// Close shuts every sink down. Sinks are closed in registration order so
+// operators see a deterministic shutdown sequence in logs.
+func (w *Writer) Close(ctx context.Context) error {
+	w.once.Do(func() { close(w.closed) })
+	var firstErr error
+	for _, s := range w.sinks {
+		if err := s.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// ---------- file sink ----------
+
+// fileSink writes one JSON record per line to an os.File via a single
+// background goroutine fed by a bounded channel.
+type fileSink struct {
+	ch     chan Record
+	wg     sync.WaitGroup
+	closed chan struct{}
+	once   sync.Once
+}
+
+// NewFileSink opens path for append and starts a writer goroutine. The
+// file is created with 0600 perms if absent; the parent directory must
+// already exist. capacity sizes the internal channel.
+func NewFileSink(path string, capacity int) (Sink, error) {
+	if path == "" {
+		return nil, errors.New("audit: file sink path is required")
+	}
 	if capacity <= 0 {
 		capacity = 1024
-	}
-	if path == "" {
-		return nil, errors.New("audit: path is required")
 	}
 	dir := filepath.Dir(path)
 	if dir != "" && dir != "." {
@@ -77,72 +151,52 @@ func Open(path string, capacity int) (*Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audit: open %q: %w", path, err)
 	}
-	w := newWriter(capacity)
-	w.startWriter(f)
-	return w, nil
+	return newFileSinkWriter(f, capacity), nil
 }
 
-// NewDiscard returns a Writer that drops all records. Useful for tests and
-// configurations where auditing is disabled but callers still want a
-// non-nil Writer to avoid nil checks.
-func NewDiscard() *Writer {
-	w := newWriter(0)
-	w.startWriter(io.Discard)
-	return w
-}
-
-func newWriter(capacity int) *Writer {
+func newFileSinkWriter(dst io.Writer, capacity int) *fileSink {
 	if capacity <= 0 {
 		capacity = 1
 	}
-	return &Writer{
+	s := &fileSink{
 		ch:     make(chan Record, capacity),
 		closed: make(chan struct{}),
-		now:    time.Now,
 	}
-}
-
-func (w *Writer) startWriter(dst io.Writer) {
-	w.wg.Add(1)
+	s.wg.Add(1)
 	go func() {
-		defer w.wg.Done()
+		defer s.wg.Done()
 		enc := json.NewEncoder(dst)
-		for r := range w.ch {
+		for r := range s.ch {
 			_ = enc.Encode(r)
 		}
 		if c, ok := dst.(io.Closer); ok {
 			_ = c.Close()
 		}
 	}()
+	return s
 }
 
-// Write enqueues a record. The send blocks when the channel is full so
-// backpressure propagates rather than silently dropping audit events.
-// After Close, Write becomes a no-op.
-func (w *Writer) Write(r Record) {
+func (s *fileSink) Write(r Record) error {
 	select {
-	case <-w.closed:
-		return
+	case <-s.closed:
+		return errSinkClosed
 	default:
 	}
-	if r.Timestamp.IsZero() {
-		r.Timestamp = w.now()
-	}
 	select {
-	case w.ch <- r:
-	case <-w.closed:
+	case s.ch <- r:
+		return nil
+	case <-s.closed:
+		return errSinkClosed
 	}
 }
 
-// Close drains the channel and waits for the writer goroutine to exit.
-// Safe to call multiple times.
-func (w *Writer) Close(ctx context.Context) error {
-	w.once.Do(func() {
-		close(w.closed)
-		close(w.ch)
+func (s *fileSink) Close(ctx context.Context) error {
+	s.once.Do(func() {
+		close(s.closed)
+		close(s.ch)
 	})
 	done := make(chan struct{})
-	go func() { w.wg.Wait(); close(done) }()
+	go func() { s.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 		return nil
@@ -150,3 +204,5 @@ func (w *Writer) Close(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
+
+var errSinkClosed = errors.New("audit: sink closed")
