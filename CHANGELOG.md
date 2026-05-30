@@ -4,13 +4,17 @@ All notable changes to potent are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-05-30
+
 ### Added
 - S3 audit sink (`-audit-sink-s3 s3://bucket/prefix`). Records are buffered in memory and uploaded either every `-audit-s3-flush-interval` (default 5 minutes) or once buffered bytes cross `-audit-s3-flush-bytes` (default 5 MiB), whichever comes first. Keys are Hive-partitioned (`year=YYYY/month=MM/day=DD/hour=HH/audit-<ts>.jsonl`) so Athena, BigQuery External, Trino, and Spark auto-discover the partitions. Default AWS credential chain is used (env vars, shared profile, EC2/EKS/ECS instance roles). The audit pipeline now supports multiple sinks at once, so `-audit-log` and `-audit-sink-s3` can be active in the same process. Internal refactor introduces an `audit.Sink` interface and `audit.NewWriter(sinks ...Sink)` constructor; existing `audit.Open` and `audit.NewDiscard` remain for backwards compatibility.
 
 ### Changed
 - `audit.Writer` is now a fan-out dispatcher rather than a single-channel writer; each sink owns its own buffering and shutdown. Behavior is unchanged for callers using `audit.Open(path, cap)`.
 
-### Added (previous entries)
+## [0.1.13] - earlier
+
+### Added
 - OIDC bearer-token validation. New `internal/oidc` package fetches JWKS from the IdP, caches keys, refreshes in the background, and verifies inbound JWTs (RS256/RS384/RS512/ES256/ES384/ES512). Claim gates: `iss`, `aud`, `exp`, `nbf` (30-second clock-skew tolerance). The configured caller claim (default `sub`) is extracted and attached to the request context so per-tool `allowed_callers` ACLs work unchanged. CLI flags: `-oidc-jwks-url`, `-oidc-issuer`, `-oidc-audience`, `-oidc-caller-claim`, `-oidc-refresh-interval`. The `none` algorithm is explicitly rejected.
 - Per-tool PII redaction. New policy fields `replay_strategy` and `redact_request_body`. `replay_strategy: synthesized_ack` skips storing the upstream response body and returns a configurable `synthesized_response` template (with `$hash` and `$tool` expansion) on replay. `redact_request_body: true` stores `nil` for the raw inbound bytes; the fingerprint hash keeps the cache functional. Together, sensitive bytes from the upstream and from the request stay off disk. Verified by scanning the bolt file in tests.
 - W3C Trace Context propagation. New `internal/tracing` package parses the inbound `Traceparent` header (or generates one when missing), stores a `SpanContext` in the request context, echoes potent's chosen context on the response, propagates it to upstream on every HTTP and MCP HTTP forward, and injects `trace_id` + `span_id` into structured logs via a wrapping `slog.Handler`. Audit log records gain a `trace_id` field. No OpenTelemetry SDK is bundled; this is the minimum that lets Datadog/Honeycomb/Jaeger correlate the agent + potent + upstream hops out of the box.
