@@ -4,6 +4,11 @@ All notable changes to potent are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-05-30
+
+### Fixed
+- Policy YAML loader stripped surrounding double or single quotes from inline list elements. Before the fix, a policy that used YAML's quoted-string syntax (e.g. `fingerprint_fields: ["path"]`) silently produced the empty-object fingerprint for every request on that tool, disabling exact-match dedup. Every shipped example used bare identifiers so this surfaced only when an external operator wrote a YAML-correct quoted list. Caught by an end-to-end smoke test through `mcp-stdio` against `npx @modelcontextprotocol/server-filesystem`.
+
 ## [0.1.14] - 2026-05-30
 
 ### Added
