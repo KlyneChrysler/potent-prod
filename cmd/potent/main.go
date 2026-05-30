@@ -65,8 +65,11 @@ func run() error {
 	policyPath := flag.String("policy", "configs/policy.yaml", "policy YAML path")
 	backend := flag.String("store", "memory", "store backend: memory | bolt | postgres (set POTENT_PG_DSN for postgres)")
 	dbPath := flag.String("db", "potent.db", "BoltDB file path (when -store=bolt)")
-	embedDim := flag.Int("embed-dim", 384, "embedding dimension")
-	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
+	embedDim := flag.Int("embed-dim", 384, "embedding dimension (hashing backend); auto-discovered for http backend")
+	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the hashing embedder")
+	embedBackend := flag.String("embed-backend", "hashing", "embedder backend: hashing (built-in TF-IDF) | http (external transformer service)")
+	embedURL := flag.String("embed-url", "", "HTTP embedder URL (when -embed-backend=http); receives POST {\"input\":\"...\"}, returns {\"embedding\":[...]} or OpenAI-shape {\"data\":[{\"embedding\":[...]}]}")
+	embedTimeout := flag.Duration("embed-timeout", 10*time.Second, "per-request timeout for the HTTP embedder")
 	auditPath := flag.String("audit-log", "", "append JSONL audit records to this path (empty = disabled)")
 	auditS3URL := flag.String("audit-sink-s3", "", "ship audit records to an S3 destination, e.g. s3://my-bucket/potent/audit (uses default AWS credential chain)")
 	auditS3FlushInterval := flag.Duration("audit-s3-flush-interval", 5*time.Minute, "maximum age of buffered records before an s3 upload is forced")
@@ -135,7 +138,7 @@ func run() error {
 		}
 	}
 
-	emb, err := embed.NewHashingTFIDF(*embedDim, *embedN)
+	emb, err := buildEmbedder(*embedBackend, *embedDim, *embedN, *embedURL, *embedTimeout, logger)
 	if err != nil {
 		return fmt.Errorf("embedder: %w", err)
 	}
@@ -426,6 +429,44 @@ func buildUpstreamTLS(caPath, certPath, keyPath string, skipVerify bool, logger 
 		cfg.Certificates = []tls.Certificate{cert}
 	}
 	return cfg, nil
+}
+
+// buildEmbedder selects the embedder backend. Operators wire the built-in
+// hashing TF-IDF (zero-dep, default) or point at any external HTTP
+// embedding service (sentence-transformers, ollama, OpenAI-compatible
+// API, or a 30-line FastAPI shim around fastembed).
+//
+// Auth headers for the HTTP backend come from POTENT_EMBED_API_KEY (sent
+// as "Authorization: Bearer ...") so secrets stay out of process flags.
+func buildEmbedder(backend string, dim, ngram int, url string, timeout time.Duration, logger *slog.Logger) (embed.Embedder, error) {
+	switch backend {
+	case "hashing", "":
+		return embed.NewHashingTFIDF(dim, ngram)
+	case "http":
+		if url == "" {
+			return nil, errors.New("-embed-backend=http requires -embed-url")
+		}
+		headers := map[string]string{}
+		if key := os.Getenv("POTENT_EMBED_API_KEY"); key != "" {
+			headers["Authorization"] = "Bearer " + key
+		}
+		opts := embed.HTTPEmbedderOptions{
+			URL:     url,
+			Dim:     dim,
+			Timeout: timeout,
+			Headers: headers,
+		}
+		// Dim=0 enables discovery; treat the default 384 as "unset" so
+		// operators don't have to remember to pass -embed-dim=0 to let
+		// the backend self-report.
+		if dim == 384 {
+			opts.Dim = 0
+		}
+		logger.Info("http embedder enabled", "url", url, "timeout", timeout)
+		return embed.NewHTTPEmbedder(opts)
+	default:
+		return nil, fmt.Errorf("unknown embedder backend %q (want hashing | http)", backend)
+	}
 }
 
 // compactReporter returns a callback that logs compact results uniformly

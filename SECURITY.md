@@ -31,14 +31,44 @@ Patches are released against the latest minor version. Pre-1.0 minor versions ma
 - Distroless `nonroot` container image; `readOnlyRootFilesystem`, dropped capabilities, RuntimeDefault seccomp in the supplied k8s manifest.
 - `gosec`, `staticcheck`, and `govulncheck` run on every push and pull request.
 - Release artifacts built by GitHub Actions with verified action SHAs and pinned tool versions.
+- Every release ships a CycloneDX SBOM per archive and is keyless-signed via cosign + Sigstore.
+
+## Verifying releases
+
+Every published archive has a sibling `.cyclonedx.json` SBOM. The
+`checksums.txt` file is signed; verify the signature, then the checksums,
+then any individual artifact.
+
+```bash
+# 1. download release assets from the GitHub release page
+#    (potent_<ver>_<os>_<arch>.tar.gz, checksums.txt, checksums.txt.sig,
+#     checksums.txt.pem, and any per-archive .cyclonedx.json files)
+
+# 2. verify the signature on checksums.txt
+cosign verify-blob \
+    --certificate-identity-regexp 'https://github.com/KlyneChrysler/potent-prod/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --signature checksums.txt.sig \
+    --certificate checksums.txt.pem \
+    checksums.txt
+
+# 3. verify each archive against the now-trusted checksums
+sha256sum -c checksums.txt
+
+# 4. verify the container image signature
+cosign verify ghcr.io/klynechrysler/potent:<ver> \
+    --certificate-identity-regexp 'https://github.com/KlyneChrysler/potent-prod/' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# 5. scan the SBOM for known vulnerabilities
+grype sbom:./potent_<ver>_linux_amd64.tar.gz.cyclonedx.json
+```
 
 ## Known limitations (pre-1.0)
 
-- No OIDC / SSO integration. The proxy and admin auth are static bearer tokens. Enterprise IdP integration is on the v0.2 roadmap.
-- No mTLS to upstream. TLS validation uses the system trust store. Custom CA bundles are not yet first-class.
-- No PII redaction in the audit log. Cached request and response bodies are stored verbatim. Treat the audit log as sensitive.
-- The bolt store is not encrypted at rest. Mount the volume on an encrypted filesystem in untrusted environments.
-- Embedder is a hashing-TFIDF approximation. False positives are possible. Tune `semantic_threshold` per tool; raise it on side-effecting tools like `charge_card`.
+- The bolt store is not encrypted at rest. Use Postgres (`-store=postgres`) for encrypted-at-rest deployments, or mount the bolt volume on an encrypted filesystem.
+- Built-in `hashing` embedder is a hashing-TFIDF approximation. False positives are possible. For production semantic dedup use `-embed-backend=http` with a real transformer model (sentence-transformers, OpenAI, etc.).
+- Audit-log records may contain user data when `redact_request_body` is off for a tool. Treat the audit log as sensitive; the S3 sink supports SSE via the bucket policy.
 
 ## Acknowledgements
 

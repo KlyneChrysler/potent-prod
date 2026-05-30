@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   packages: write
+  id-token: write  # cosign keyless signing via OIDC
 
 jobs:
   goreleaser:
@@ -35,6 +36,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+        with:
+          cosign-release: v2.4.1
+
+      - name: install syft
+        uses: anchore/sbom-action/download-syft@cb103df8a4435c4ac8a4f0aa1d8d3a31f97ba66c # v0.17.7
+        with:
+          syft-version: v1.18.1
 
       - name: goreleaser
         uses: goreleaser/goreleaser-action@286f3b13b1b49da4ac219696163fb8c1c93e1200 # v6.0.0
