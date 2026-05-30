@@ -4,6 +4,21 @@ All notable changes to potent are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-30
+
+### Added
+- HTTP embedder backend (`-embed-backend=http -embed-url ...`). Operators plug in any external embedding service that follows the minimal contract `POST {"input": "<text>"} -> {"embedding": [...]}` (also accepts the OpenAI-shape `{"data": [{"embedding": [...]}]}`). Compatible out of the box with sentence-transformers, OpenAI, Ollama, Cohere, Voyage, or any FastAPI shim. Auth via `POTENT_EMBED_API_KEY` env var (sent as `Authorization: Bearer ...`). Dim auto-discovered on first call; vectors L2-normalised client-side so backends returning raw transformer hidden states still produce cosine in `[-1, 1]`. Falls back to writing the cache entry without an embedding on timeout or non-2xx; exact-match dedup keeps working. New `internal/embed/http.go` with 93.2% coverage; verified end-to-end against a local Python embedding server through potent's HTTP mode.
+- Supply-chain hardening: every release now ships a CycloneDX SBOM per archive (via syft) and is keyless-signed via cosign + Sigstore. Container images signed too. New `docs/benchmarks.md` documents reproducible numbers.
+
+### Changed
+- Embedder selection is now a flag (`-embed-backend`) instead of an implicit default. `hashing` (the prior behavior) remains the default; explicit opt-in to `http` for transformer-quality semantic dedup.
+
+### Performance baseline
+- BenchmarkApply_ExactReplay: 8.8 µs/op (~113k req/s ceiling single-thread)
+- BenchmarkApply_ForwardMiss: 9.1 µs/op
+- End-to-end HTTP: 6.7k req/s sustained at 100 concurrent on M1, p95 < 41 ms
+- See `docs/benchmarks.md` for reproduction commands and the thundering-herd note on hot-cache p99.
+
 ## [0.1.16] - 2026-05-30
 
 ### Added

@@ -23,8 +23,12 @@ For an overview of the pipeline and package layout, see [architecture.md](./arch
 | `-store`         | `memory`               | `memory` \| `bolt` \| `postgres`        |
 | `-db`            | `potent.db`            | BoltDB file path (when `-store=bolt`)   |
 | `POTENT_PG_DSN`  | (env, required for pg) | Postgres connection URL (when `-store=postgres`) |
-| `-embed-dim`     | `384`                  | Embedding dimension                     |
-| `-embed-ngram`   | `4`                    | Char n-gram size for the embedder       |
+| `-embed-backend` | `hashing`              | `hashing` (built-in TF-IDF) \| `http` (external transformer) |
+| `-embed-url`     | (required for http)    | HTTP embedder endpoint                  |
+| `-embed-timeout` | `10s`                  | Per-request timeout for HTTP embedder   |
+| `-embed-dim`     | `384`                  | Embedding dimension (hashing); auto-discovered for HTTP |
+| `-embed-ngram`   | `4`                    | Char n-gram size for the hashing embedder |
+| `POTENT_EMBED_API_KEY` | (env)            | Sent as `Authorization: Bearer ...` on HTTP embedder requests |
 | `-audit-log`     | (disabled)             | JSONL audit records appended here       |
 | `-audit-sink-s3` | (disabled)             | Ship audit records to S3, e.g. `s3://my-bucket/potent/audit` (uses default AWS credential chain) |
 | `-audit-s3-flush-interval` | `5m`         | Max age of buffered records before an S3 upload is forced |
@@ -62,6 +66,53 @@ tools:
 - **cache** — replay cached responses for read-only tools (search, lookups)
 - **log_only** — detect duplicates and log them; always forward
 - **off** — bypass the pipeline entirely
+
+## HTTP embedder (`-embed-backend=http`)
+
+The built-in `hashing` embedder is a character-n-gram + TF-IDF hash and
+gives mediocre F1 on semantic dedup (see `docs/eval/results.md`). For
+production semantic matching, point potent at any external embedding
+service that follows a minimal contract:
+
+```
+POST <URL>
+Content-Type: application/json
+Authorization: Bearer <POTENT_EMBED_API_KEY>   (optional)
+
+{"input": "<text>"}
+
+200 OK
+{"embedding": [<float32>, ...]}
+
+or OpenAI-compatible:
+{"data": [{"embedding": [<float32>, ...]}]}
+```
+
+Compatible services out of the box:
+
+- **sentence-transformers HTTP server** (`docker run -p 8001:80 ghcr.io/huggingface/text-embeddings-inference:latest`)
+- **OpenAI embeddings** (`-embed-url https://api.openai.com/v1/embeddings`, set `POTENT_EMBED_API_KEY`)
+- **Ollama** (`-embed-url http://localhost:11434/api/embeddings`)
+- **Cohere, Voyage, any FastAPI shim** that matches the contract
+
+Configuration:
+
+```
+potent -embed-backend http \
+       -embed-url http://localhost:8001/embed \
+       -embed-timeout 5s \
+       ...
+```
+
+Dimension is discovered on the first successful call; pass `-embed-dim`
+explicitly only to enforce a contract (mismatch is fatal). Vectors are
+L2-normalised on the client side so backends that return raw transformer
+hidden states still produce cosine in `[-1, 1]`.
+
+The embedder is only invoked when a tool's policy has
+`semantic_threshold > 0` and the request misses on exact match. A timeout
+or non-2xx response fails the lookup gracefully: the cache entry is
+written without an embedding, so exact-match dedup keeps working.
 
 ## Postgres store (`-store=postgres`)
 
