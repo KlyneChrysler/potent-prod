@@ -4,6 +4,16 @@ All notable changes to potent are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-05-30
+
+### Added
+- Postgres store backend (`-store=postgres`, DSN via `POTENT_PG_DSN`). Multiple potent replicas can sit behind a load balancer and share one cache; a node going away no longer loses the cache. Last-write-wins upsert on `(tool, hash)`; `replay_count` aggregates across replicas. Background TTL eviction reuses `-bolt-compact-interval` (flag name kept for backwards compatibility). Schema is created on first connect; no separate migration tool. Uses `github.com/jackc/pgx/v5/pgxpool`; embeddings packed as little-endian IEEE-754 bytes so no `pgvector` dependency.
+- HA verified end-to-end: two potent instances sharing one Postgres dedupe a single fingerprint to one upstream call total (not one per instance).
+- New `postgres-integration` CI job runs the conformance suite against a real Postgres 16 service container on every push and PR.
+
+### Fixed
+- Audit log now records the actual wire decision instead of the lookup-time decision. Concurrent followers that coalesced as waiters used to be logged as `decision=forward` even though they never reached upstream; they now log as `decision=replay match=coalesced`. Caught during a 50-concurrent stress test (only 1 upstream hit, audit was reporting 19). Operators computing cost savings or compliance dedup rates from the audit log now get correct numbers. New regression test pins the semantics. New match kind `coalesced` distinguishes in-flight dedup from cache-hit on an existing entry (which keeps `match=exact`).
+
 ## [0.1.15] - 2026-05-30
 
 ### Fixed

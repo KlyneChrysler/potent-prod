@@ -54,6 +54,35 @@ jobs:
           path: coverage.out
           retention-days: 14
 
+  postgres-integration:
+    name: postgres-integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: potent
+          POSTGRES_PASSWORD: potent
+          POSTGRES_DB: potent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U potent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-go@cdcb36043654635271a94b9a6d1392de5bb323a7 # v5.0.1
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: postgres conformance suite
+        env:
+          POTENT_TEST_PG_DSN: postgres://potent:potent@127.0.0.1:5432/potent_test?sslmode=disable
+        run: go test -race -count=1 -run 'TestPostgres|TestEncode|TestDecode' ./internal/store/...
+
   staticcheck:
     name: staticcheck
     runs-on: ubuntu-latest
