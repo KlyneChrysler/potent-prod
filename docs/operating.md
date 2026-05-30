@@ -20,8 +20,9 @@ For an overview of the pipeline and package layout, see [architecture.md](./arch
 | `-admin-addr`    | (disabled)             | Admin API; bind to localhost in prod    |
 | `-upstream`      | (required)             | Upstream URL or stdio command           |
 | `-policy`        | `configs/policy.yaml`  | Per-tool idempotency policy             |
-| `-store`         | `memory`               | `memory` \| `bolt`                      |
+| `-store`         | `memory`               | `memory` \| `bolt` \| `postgres`        |
 | `-db`            | `potent.db`            | BoltDB file path (when `-store=bolt`)   |
+| `POTENT_PG_DSN`  | (env, required for pg) | Postgres connection URL (when `-store=postgres`) |
 | `-embed-dim`     | `384`                  | Embedding dimension                     |
 | `-embed-ngram`   | `4`                    | Char n-gram size for the embedder       |
 | `-audit-log`     | (disabled)             | JSONL audit records appended here       |
@@ -61,6 +62,54 @@ tools:
 - **cache** — replay cached responses for read-only tools (search, lookups)
 - **log_only** — detect duplicates and log them; always forward
 - **off** — bypass the pipeline entirely
+
+## Postgres store (`-store=postgres`)
+
+For HA deployments where multiple potent replicas need to share cache state
+behind a load balancer, use the Postgres backend instead of bolt:
+
+```
+POTENT_PG_DSN="postgres://potent:secret@db.internal:5432/potent?sslmode=require" \
+potent -store postgres ...
+```
+
+The DSN may be a `postgres://` URL or a libpq connection string. Default
+credential resolution follows the standard `PG*` environment variables
+when the DSN is left blank in those fields.
+
+The schema is created on first connect:
+
+```sql
+CREATE TABLE potent_entries (
+    tool         text        NOT NULL,
+    hash         text        NOT NULL,
+    request      bytea,
+    response     bytea,
+    status_code  int         NOT NULL,
+    created_at   timestamptz NOT NULL,
+    ttl_ms       bigint      NOT NULL,
+    replay_count int         NOT NULL DEFAULT 0,
+    embedding    bytea,
+    PRIMARY KEY (tool, hash)
+);
+CREATE INDEX potent_entries_tool_created
+    ON potent_entries (tool, created_at);
+```
+
+Required IAM/role: `SELECT`, `INSERT`, `UPDATE`, `DELETE` on
+`potent_entries`. The role does not need DDL after the first connect (a
+follow-up `CREATE TABLE IF NOT EXISTS` is a no-op once the table exists).
+
+TTL eviction happens lazily on `Get` plus a background `DELETE` driven by
+`-bolt-compact-interval` (the flag name is kept for backwards
+compatibility; it applies to both bolt and postgres backends). Default is
+hourly; `0` disables.
+
+Multi-node behavior: two potent replicas with the same DSN share the cache
+through a last-write-wins upsert. `replay_count` aggregates across
+replicas. A replica losing its connection returns 5xx from its store call
+(coalesced into the audit as a forward); a healthy peer continues to
+serve.
 
 ## Admin API (`-admin-addr`)
 

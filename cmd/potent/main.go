@@ -63,7 +63,7 @@ func run() error {
 	metricsAddr := flag.String("metrics-addr", ":9090", "metrics listen address (http and mcp-http)")
 	upstream := flag.String("upstream", "", "upstream URL (http, mcp-http) or command (mcp-stdio)")
 	policyPath := flag.String("policy", "configs/policy.yaml", "policy YAML path")
-	backend := flag.String("store", "memory", "store backend: memory | bolt")
+	backend := flag.String("store", "memory", "store backend: memory | bolt | postgres (set POTENT_PG_DSN for postgres)")
 	dbPath := flag.String("db", "potent.db", "BoltDB file path (when -store=bolt)")
 	embedDim := flag.Int("embed-dim", 384, "embedding dimension")
 	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
@@ -74,7 +74,7 @@ func run() error {
 	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled; recommend 127.0.0.1:9095)")
 	maxBodyBytes := flag.Int64("max-body-bytes", 1<<20, "cap on inbound tool-call request bodies (0 = unlimited; recommend leaving the default)")
 	stdioTimeout := flag.Duration("stdio-request-timeout", 60*time.Second, "how long an in-flight mcp-stdio tools/call may wait for a response before being treated as failed")
-	compactInterval := flag.Duration("bolt-compact-interval", time.Hour, "how often the bolt store sweeps expired entries from disk (0 = disabled)")
+	compactInterval := flag.Duration("bolt-compact-interval", time.Hour, "how often the bolt or postgres store sweeps expired entries (0 = disabled); flag name kept for backwards compatibility")
 	tokensFile := flag.String("api-tokens-file", "", "YAML file mapping caller-id -> bearer token; enables per-tool ACLs (overrides POTENT_API_TOKEN when set)")
 	upstreamCA := flag.String("upstream-ca", "", "PEM file with extra CAs trusted for upstream TLS (defaults to system trust store)")
 	upstreamCert := flag.String("upstream-cert", "", "PEM file with client certificate for mTLS to upstream")
@@ -121,20 +121,18 @@ func run() error {
 	}
 	defer closeStore()
 
-	// Start the bolt compactor in a background goroutine so on-disk entries
-	// past their TTL are reclaimed even when never accessed via Get.
-	if b, ok := st.(*store.Bolt); ok && *compactInterval > 0 {
+	// Start a background compactor so on-disk entries past their TTL are
+	// reclaimed even when never accessed via Get. Both bolt and postgres
+	// backends expose the same RunCompactor shape.
+	if *compactInterval > 0 {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
-		go b.RunCompactor(ctx, *compactInterval, func(removed int, cerr error) {
-			if cerr != nil {
-				logger.Warn("bolt compactor", "err", cerr)
-				return
-			}
-			if removed > 0 {
-				logger.Info("bolt compact", "removed", removed)
-			}
-		})
+		switch b := st.(type) {
+		case *store.Bolt:
+			go b.RunCompactor(ctx, *compactInterval, compactReporter(logger, "bolt"))
+		case *store.Postgres:
+			go b.RunCompactor(ctx, *compactInterval, compactReporter(logger, "postgres"))
+		}
 	}
 
 	emb, err := embed.NewHashingTFIDF(*embedDim, *embedN)
@@ -430,6 +428,21 @@ func buildUpstreamTLS(caPath, certPath, keyPath string, skipVerify bool, logger 
 	return cfg, nil
 }
 
+// compactReporter returns a callback that logs compact results uniformly
+// across store backends, so operators see consistent log lines regardless
+// of whether they run on bolt or postgres.
+func compactReporter(logger *slog.Logger, backend string) func(removed int, err error) {
+	return func(removed int, err error) {
+		if err != nil {
+			logger.Warn("compactor", "backend", backend, "err", err)
+			return
+		}
+		if removed > 0 {
+			logger.Info("compact", "backend", backend, "removed", removed)
+		}
+	}
+}
+
 func buildAuditSinks(filePath, s3URL string, s3Interval time.Duration, s3Bytes int, logger *slog.Logger) ([]audit.Sink, error) {
 	var sinks []audit.Sink
 	if filePath != "" {
@@ -479,6 +492,19 @@ func openStore(backend, dbPath string, logger *slog.Logger) (store.Store, func()
 			}
 		}
 		return b, closer, nil
+	case "postgres":
+		dsn := os.Getenv("POTENT_PG_DSN")
+		if dsn == "" {
+			return nil, nil, errors.New("-store=postgres requires POTENT_PG_DSN environment variable")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		p, err := store.OpenPostgres(ctx, dsn, time.Now)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open postgres store: %w", err)
+		}
+		closer := func() { p.Close() }
+		return p, closer, nil
 	default:
 		return nil, nil, fmt.Errorf("unknown store backend %q", backend)
 	}
