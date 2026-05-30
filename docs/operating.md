@@ -25,6 +25,9 @@ For an overview of the pipeline and package layout, see [architecture.md](./arch
 | `-embed-dim`     | `384`                  | Embedding dimension                     |
 | `-embed-ngram`   | `4`                    | Char n-gram size for the embedder       |
 | `-audit-log`     | (disabled)             | JSONL audit records appended here       |
+| `-audit-sink-s3` | (disabled)             | Ship audit records to S3, e.g. `s3://my-bucket/potent/audit` (uses default AWS credential chain) |
+| `-audit-s3-flush-interval` | `5m`         | Max age of buffered records before an S3 upload is forced |
+| `-audit-s3-flush-bytes` | `5242880` (5 MiB) | Buffered byte threshold that triggers an S3 upload |
 | `-max-body-bytes` | `1048576` (1 MiB)     | Cap on inbound tool-call request bodies. `0` disables. |
 | `-stdio-request-timeout` | `60s`          | How long an in-flight mcp-stdio `tools/call` may wait before being treated as failed. |
 | `-bolt-compact-interval` | `1h`           | How often the bolt store sweeps expired entries from disk. `0` disables. |
@@ -93,6 +96,43 @@ Each decision appends one JSON line:
 Sends are buffered through a 1024-deep channel; the writer goroutine drains
 the buffer on shutdown. Disk full or slow downstream applies backpressure to
 the request path.
+
+## S3 audit sink (`-audit-sink-s3`)
+
+For compliance retention or cross-account analytics, ship audit records to S3
+in parallel with (or instead of) the local file:
+
+```
+-audit-sink-s3 s3://my-bucket/potent/audit
+-audit-s3-flush-interval 5m
+-audit-s3-flush-bytes 5242880
+```
+
+Records buffer in memory and flush either every `flush-interval` or once
+`flush-bytes` is exceeded, whichever fires first. Keys are Hive-partitioned:
+
+```
+my-bucket/potent/audit/year=2026/month=05/day=30/hour=14/audit-20260530T143205Z.jsonl
+```
+
+Athena, BigQuery External, Trino, and Spark auto-discover these partitions
+without explicit `ADD PARTITION` statements. Credentials come from the
+default AWS SDK chain: env vars (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+/ `AWS_SESSION_TOKEN`), the shared config file, or an EC2/EKS/ECS instance
+role. The minimum IAM permission is `s3:PutObject` on the destination prefix.
+
+Both sinks can be active simultaneously. A common production setup is local
+file for live debugging plus S3 for durable retention:
+
+```
+potent -audit-log /var/log/potent/audit.jsonl \
+       -audit-sink-s3 s3://acme-compliance/potent/audit
+```
+
+PutObject errors are logged at `error` level with `bucket`, `key`, and byte
+count; the buffer is dropped after the failed attempt so a wedged bucket
+cannot exhaust process memory. For at-least-once durability use both sinks
+and reconcile from the local file when the S3 upload was lost.
 
 ## OIDC bearer tokens
 

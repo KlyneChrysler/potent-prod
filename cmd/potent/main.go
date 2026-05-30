@@ -68,6 +68,9 @@ func run() error {
 	embedDim := flag.Int("embed-dim", 384, "embedding dimension")
 	embedN := flag.Int("embed-ngram", 4, "character n-gram size for the embedder")
 	auditPath := flag.String("audit-log", "", "append JSONL audit records to this path (empty = disabled)")
+	auditS3URL := flag.String("audit-sink-s3", "", "ship audit records to an S3 destination, e.g. s3://my-bucket/potent/audit (uses default AWS credential chain)")
+	auditS3FlushInterval := flag.Duration("audit-s3-flush-interval", 5*time.Minute, "maximum age of buffered records before an s3 upload is forced")
+	auditS3FlushBytes := flag.Int("audit-s3-flush-bytes", 5*1024*1024, "buffered byte threshold that triggers an s3 upload")
 	adminAddr := flag.String("admin-addr", "", "admin HTTP API listen address (empty = disabled; recommend 127.0.0.1:9095)")
 	maxBodyBytes := flag.Int64("max-body-bytes", 1<<20, "cap on inbound tool-call request bodies (0 = unlimited; recommend leaving the default)")
 	stdioTimeout := flag.Duration("stdio-request-timeout", 60*time.Second, "how long an in-flight mcp-stdio tools/call may wait for a response before being treated as failed")
@@ -139,25 +142,18 @@ func run() error {
 		return fmt.Errorf("embedder: %w", err)
 	}
 
-	var auditWriter *audit.Writer
-	if *auditPath != "" {
-		auditWriter, err = audit.Open(*auditPath, 1024)
-		if err != nil {
-			return fmt.Errorf("audit: %w", err)
-		}
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = auditWriter.Close(ctx)
-		}()
-	} else {
-		auditWriter = audit.NewDiscard()
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			_ = auditWriter.Close(ctx)
-		}()
+	auditSinks, err := buildAuditSinks(*auditPath, *auditS3URL, *auditS3FlushInterval, *auditS3FlushBytes, logger)
+	if err != nil {
+		return fmt.Errorf("audit: %w", err)
 	}
+	auditWriter := audit.NewWriter(auditSinks...)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := auditWriter.Close(ctx); err != nil {
+			logger.Warn("audit shutdown", "err", err)
+		}
+	}()
 
 	m := metrics.New(nil)
 	plOpts := []pipeline.Option{
@@ -432,6 +428,40 @@ func buildUpstreamTLS(caPath, certPath, keyPath string, skipVerify bool, logger 
 		cfg.Certificates = []tls.Certificate{cert}
 	}
 	return cfg, nil
+}
+
+func buildAuditSinks(filePath, s3URL string, s3Interval time.Duration, s3Bytes int, logger *slog.Logger) ([]audit.Sink, error) {
+	var sinks []audit.Sink
+	if filePath != "" {
+		fs, err := audit.NewFileSink(filePath, 1024)
+		if err != nil {
+			return nil, fmt.Errorf("file sink: %w", err)
+		}
+		sinks = append(sinks, fs)
+		logger.Info("audit file sink enabled", "path", filePath)
+	}
+	if s3URL != "" {
+		bucket, prefix, err := audit.ParseS3URL(s3URL)
+		if err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		s, err := audit.NewS3Sink(ctx, audit.S3SinkOptions{
+			Bucket:        bucket,
+			Prefix:        prefix,
+			FlushInterval: s3Interval,
+			FlushBytes:    s3Bytes,
+			Logger:        logger,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("s3 sink: %w", err)
+		}
+		sinks = append(sinks, s)
+		logger.Info("audit s3 sink enabled", "bucket", bucket, "prefix", prefix,
+			"flush_interval", s3Interval, "flush_bytes", s3Bytes)
+	}
+	return sinks, nil
 }
 
 func openStore(backend, dbPath string, logger *slog.Logger) (store.Store, func(), error) {
