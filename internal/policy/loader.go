@@ -263,7 +263,7 @@ func parseInlineList(s string) []string {
 		return nil
 	}
 	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
-		return []string{s}
+		return []string{trimQuotes(s)}
 	}
 	inner := strings.TrimSpace(s[1 : len(s)-1])
 	if inner == "" {
@@ -272,10 +272,22 @@ func parseInlineList(s string) []string {
 	parts := strings.Split(inner, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(p)
+		p = trimQuotes(strings.TrimSpace(p))
 		if p != "" {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+// trimQuotes strips a single pair of surrounding single or double quotes.
+// YAML scalars are quoted to escape special characters; the quotes are
+// syntactic and never part of the value.
+func trimQuotes(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
 }

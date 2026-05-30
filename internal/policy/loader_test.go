@@ -146,6 +146,33 @@ tools:
 	}
 }
 
+func TestParseInlineList_StripsQuotes(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{`[path]`, []string{"path"}},
+		{`["path"]`, []string{"path"}},
+		{`['path']`, []string{"path"}},
+		{`["to", "subject"]`, []string{"to", "subject"}},
+		{`[to, "subject", 'body']`, []string{"to", "subject", "body"}},
+		{`path`, []string{"path"}},
+		{`"path"`, []string{"path"}},
+	}
+	for _, c := range cases {
+		got := parseInlineList(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("parseInlineList(%q) = %v, want %v", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("parseInlineList(%q)[%d] = %q, want %q", c.in, i, got[i], c.want[i])
+			}
+		}
+	}
+}
+
 func TestParseDuration_Extensions(t *testing.T) {
 	tests := []struct {
 		in   string
