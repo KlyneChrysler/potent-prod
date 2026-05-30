@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/potent/potent/internal/audit"
 	"github.com/potent/potent/internal/embed"
 	"github.com/potent/potent/internal/metrics"
 	"github.com/potent/potent/internal/policy"
@@ -56,6 +57,88 @@ func TestApply_StrictReplaysExactDuplicate(t *testing.T) {
 		t.Errorf("forward called %d times, want 1", calls)
 	}
 }
+
+func TestApply_AuditReflectsCoalesceOutcome(t *testing.T) {
+	// regression: prior to v0.1.16 audit recorded the lookup-time decision,
+	// so concurrent followers that ended up coalesced were misreported as
+	// "forward". the audit must reflect what actually happened on the wire
+	// so cost reporting and compliance accounting are honest.
+	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{
+		"t": {Mode: policy.ModeStrict, TTL: time.Hour, FingerprintFields: []string{"k"}},
+	}}
+	var recs []audit.Record
+	var recMu sync.Mutex
+	captureSink := captureSink{out: &recs, mu: &recMu}
+	w := audit.NewWriter(captureSink)
+	pl := New(cfg, store.NewMemory(nil), WithAudit(w))
+
+	leaderStart := make(chan struct{})
+	leaderRelease := make(chan struct{})
+	var calls int32
+	forward := func(ctx context.Context) (int, []byte, error) {
+		atomic.AddInt32(&calls, 1)
+		close(leaderStart)
+		<-leaderRelease
+		return 200, []byte(`{"ok":true}`), nil
+	}
+
+	const N = 50
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = pl.Apply(context.Background(), "t", "", []byte(`{"k":"v"}`), forward)
+		}()
+	}
+	<-leaderStart
+	// give all followers time to enqueue
+	time.Sleep(20 * time.Millisecond)
+	close(leaderRelease)
+	wg.Wait()
+	_ = w.Close(context.Background())
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("forward called %d times, want exactly 1 (coalesce should dedupe)", got)
+	}
+
+	recMu.Lock()
+	defer recMu.Unlock()
+	var forwards, replays, coalesced int
+	for _, r := range recs {
+		switch r.Decision {
+		case "forward":
+			forwards++
+		case "replay":
+			replays++
+			if r.Match == "coalesced" {
+				coalesced++
+			}
+		}
+	}
+	if forwards != 1 {
+		t.Errorf("audit forwards = %d, want 1", forwards)
+	}
+	if replays != N-1 {
+		t.Errorf("audit replays = %d, want %d", replays, N-1)
+	}
+	if coalesced == 0 {
+		t.Errorf("expected at least one coalesced replay, got none (match breakdown: %+v)", recs)
+	}
+}
+
+type captureSink struct {
+	out *[]audit.Record
+	mu  *sync.Mutex
+}
+
+func (c captureSink) Write(r audit.Record) error {
+	c.mu.Lock()
+	*c.out = append(*c.out, r)
+	c.mu.Unlock()
+	return nil
+}
+func (c captureSink) Close(context.Context) error { return nil }
 
 func TestApply_OffModeAlwaysForwards(t *testing.T) {
 	cfg := &policy.Config{Tools: map[string]policy.ToolPolicy{"t": {Mode: policy.ModeOff}}}

@@ -309,18 +309,20 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 	}
 
 	decision, entry, match := p.decide(ctx, tool, hash, pol, intent)
-	p.recordDecision(tool, pol.Mode, decision)
-	p.writeAudit(ctx, tool, string(pol.Mode), decision, match, hash, entry.Hash)
 
 	// In shadow mode every decision becomes Forward on the wire while the
-	// audit log keeps the policy's view. The cache still gets written so a
-	// subsequent identical call would surface as a would-replay.
+	// audit log keeps the policy's view. shadowForward owns its own audit
+	// emission so it can stamp Shadow=true and WouldDecision.
 	if p.shadow {
+		p.recordDecision(tool, pol.Mode, decision)
+		p.writeAudit(ctx, tool, string(pol.Mode), decision, match, hash, entry.Hash)
 		return p.shadowForward(ctx, tool, hash, intent, pol, body, forward)
 	}
 
 	switch decision {
 	case DecisionReplay:
+		p.recordDecision(tool, pol.Mode, decision)
+		p.writeAudit(ctx, tool, string(pol.Mode), decision, match, hash, entry.Hash)
 		if err := p.store.IncrementReplay(ctx, tool, entry.Hash); err != nil {
 			p.recordStoreError("increment_replay")
 		}
@@ -332,18 +334,33 @@ func (p *Pipeline) Apply(ctx context.Context, tool, caller string, body []byte, 
 			Body:       renderReplayBody(tool, entry, pol),
 		}, nil
 	case DecisionBlock:
+		p.recordDecision(tool, pol.Mode, decision)
+		p.writeAudit(ctx, tool, string(pol.Mode), decision, match, hash, entry.Hash)
 		return Result{Decision: DecisionBlock, Match: match, Hash: entry.Hash, StatusCode: 409}, nil
 	default:
 		// Coalesce concurrent duplicates so only one of N siblings actually
 		// calls forward(). Strict and cache modes participate; off and
 		// log_only fall through because they always forward by design.
+		//
+		// Audit emission is postponed until coalesce resolves so the audit
+		// log reflects what actually happened on the wire. A follower that
+		// hit an empty cache at decision time but then coalesced as a
+		// waiter is audited as DecisionReplay with match=coalesced, not
+		// as a forward that never happened.
 		if pol.Mode == policy.ModeStrict || pol.Mode == policy.ModeCache {
 			if res, leader, leaderHandle := p.acquireLeader(hash); !leader {
-				return p.waitForLeader(ctx, res)
+				result, werr := p.waitForLeader(ctx, res)
+				p.recordDecision(tool, pol.Mode, result.Decision)
+				p.writeAudit(ctx, tool, string(pol.Mode), result.Decision, result.Match, hash, hash)
+				return result, werr
 			} else {
+				p.recordDecision(tool, pol.Mode, DecisionForward)
+				p.writeAudit(ctx, tool, string(pol.Mode), DecisionForward, Match{}, hash, "")
 				return p.runLeader(ctx, tool, hash, intent, pol, body, forward, leaderHandle)
 			}
 		}
+		p.recordDecision(tool, pol.Mode, DecisionForward)
+		p.writeAudit(ctx, tool, string(pol.Mode), DecisionForward, Match{}, hash, "")
 		return p.doForward(ctx, tool, hash, intent, pol, body, forward, nil)
 	}
 }
@@ -463,11 +480,13 @@ func (p *Pipeline) waitForLeader(ctx context.Context, leader *applyInflight) (Re
 		if leader.err != nil {
 			return Result{Decision: DecisionForward}, fmt.Errorf("leader failed: %w", leader.err)
 		}
-		// Borrow the leader's body/status. Mark as Replay so callers can
-		// distinguish a coalesced response from a fresh forward.
+		// Borrow the leader's body/status. Mark as Replay with
+		// match=coalesced so audit and metrics can distinguish a
+		// concurrent in-flight dedup from a cache hit on an entry that
+		// was already on disk.
 		r := leader.result
 		r.Decision = DecisionReplay
-		r.Match = Match{Kind: "exact", Similarity: 1.0}
+		r.Match = Match{Kind: "coalesced", Similarity: 1.0}
 		return r, nil
 	case <-ctx.Done():
 		return Result{Decision: DecisionForward}, ctx.Err()
